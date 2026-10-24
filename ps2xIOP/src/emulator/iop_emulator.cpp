@@ -785,6 +785,16 @@ namespace ps2x::iop::detail
                m_impl->memory.writeRam(address, source, size);
     }
 
+    bool IopEmulator::readSifRegister(uint32_t index, uint32_t &value) const
+    {
+        return m_impl->memory.readSifRegister(index, value);
+    }
+
+    bool IopEmulator::writeSifRegisterFromEe(uint32_t index, uint32_t value)
+    {
+        return m_impl->memory.writeSifRegisterFromEe(index, value);
+    }
+
     bool IopEmulator::zeroMemory(uint32_t address, size_t size)
     {
         return isMemoryRange(address, size) &&

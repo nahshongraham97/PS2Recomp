@@ -47,6 +47,8 @@ namespace ps2x::iop::detail
         void write8(uint32_t address, uint8_t value);
         void write16(uint32_t address, uint16_t value);
         void write32(uint32_t address, uint32_t value);
+        [[nodiscard]] bool readSifRegister(uint32_t index, uint32_t &value) const;
+        [[nodiscard]] bool writeSifRegisterFromEe(uint32_t index, uint32_t value);
 
         [[nodiscard]] bool readRam(uint32_t address, void *destination, size_t size) const;
         [[nodiscard]] bool writeRam(uint32_t address, const void *source, size_t size);

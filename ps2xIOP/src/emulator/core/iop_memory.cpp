@@ -13,6 +13,13 @@ namespace ps2x::iop::detail
         constexpr int kDmaSpu0Irq = 0x24;
         constexpr int kDmaSpu1Irq = 0x28;
 
+        std::optional<uint32_t> sifRegisterAddress(uint32_t index)
+        {
+            if (index < 1u || index > 4u)
+                return std::nullopt;
+            return IopMemory::SifBase + (index - 1u) * 0x10u;
+        }
+
         uint32_t alignUp(uint32_t value, uint32_t alignment)
         {
             return (value + alignment - 1u) & ~(alignment - 1u);
@@ -150,6 +157,38 @@ namespace ps2x::iop::detail
         write8(address + 3u, static_cast<uint8_t>(value >> 24u));
     }
 
+    bool IopMemory::readSifRegister(uint32_t index, uint32_t &value) const
+    {
+        const auto address = sifRegisterAddress(index);
+        if (!address)
+            return false;
+        value = readHardware32(*address);
+        return true;
+    }
+
+    bool IopMemory::writeSifRegisterFromEe(uint32_t index, uint32_t value)
+    {
+        const auto address = sifRegisterAddress(index);
+        if (!address)
+            return false;
+        switch (index)
+        {
+        case 1u:
+        case 2u:
+            m_hardware[*address] = value;
+            break;
+        case 3u:
+            m_hardware[*address] |= value;
+            break;
+        case 4u:
+            m_hardware[*address] &= ~value;
+            break;
+        default:
+            return false;
+        }
+        return true;
+    }
+
     bool IopMemory::readRam(uint32_t address, void *destination, size_t size) const
     {
         const uint32_t phys = physicalAddress(address);
@@ -233,6 +272,12 @@ namespace ps2x::iop::detail
     {
         switch (address)
         {
+        case 0x1D000020u:
+            m_hardware[address] &= ~value;
+            return;
+        case 0x1D000030u:
+            m_hardware[address] |= value;
+            return;
         case 0x1F801070u:
             m_interruptStatus &= value;
             return;

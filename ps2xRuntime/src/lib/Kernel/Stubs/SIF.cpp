@@ -80,13 +80,11 @@ namespace ps2_stubs
         uint32_t g_sifGetRegLogCount = 0u;
         uint32_t g_sifSetRegLogCount = 0u;
 
-        constexpr uint32_t kSifRegBootStatus = 0x4u;
         constexpr uint32_t kSifRegMainAddr = 0x80000000u;
         constexpr uint32_t kSifRegSubAddr = 0x80000001u;
         constexpr uint32_t kSifRegMsCom = 0x80000002u;
-        constexpr uint32_t kSifBootReadyMask = 0x00020000u;
 
-        void seedDefaultSifRegsLocked()
+        void resetSifCommandStateLocked()
         {
             g_sifRegs.clear();
             g_sifSregs.clear();
@@ -97,7 +95,6 @@ namespace ps2_stubs
             g_sifGetRegLogCount = 0u;
             g_sifSetRegLogCount = 0u;
 
-            g_sifRegs[kSifRegBootStatus] = kSifBootReadyMask;
             g_sifRegs[kSifRegMainAddr] = 0u;
             g_sifRegs[kSifRegSubAddr] = 0u;
             g_sifRegs[kSifRegMsCom] = 0u;
@@ -107,7 +104,9 @@ namespace ps2_stubs
         {
             switch (reg)
             {
+            case 0x1u:
             case 0x2u:
+            case 0x3u:
             case 0x4u:
             case 0x80000000u:
             case 0x80000001u:
@@ -123,7 +122,7 @@ namespace ps2_stubs
             SifStateInitializer()
             {
                 std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
-                seedDefaultSifRegsLocked();
+                resetSifCommandStateLocked();
             }
         } g_sifStateInitializer;
 
@@ -223,7 +222,7 @@ namespace ps2_stubs
     void resetSifState()
     {
         std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
-        seedDefaultSifRegsLocked();
+        resetSifCommandStateLocked();
     }
 
     bool dispatchSifCommand(uint8_t *rdram,
@@ -341,7 +340,7 @@ namespace ps2_stubs
     void sceSifExitCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
-        seedDefaultSifRegsLocked();
+        resetSifCommandStateLocked();
         setReturnS32(ctx, 0);
     }
 
@@ -466,6 +465,15 @@ namespace ps2_stubs
         const uint32_t reg = getRegU32(ctx, 4);
         uint32_t value = 0u;
         bool shouldLog = false;
+        if (reg >= 1u && reg <= 4u)
+        {
+            if (!PS2IopTransport::readSifRegister(runtime, reg, value))
+            {
+                std::cerr << "[sceSifGetReg] IOP SIF register source unavailable for reg="
+                          << reg << std::endl;
+            }
+        }
+        else
         {
             std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
             auto it = g_sifRegs.find(reg);
@@ -473,6 +481,9 @@ namespace ps2_stubs
             {
                 value = it->second;
             }
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
             shouldLog = shouldTraceSifReg(reg) && g_sifGetRegLogCount < 128u;
             if (shouldLog)
             {
@@ -766,6 +777,18 @@ namespace ps2_stubs
         const uint32_t value = getRegU32(ctx, 5);
         uint32_t prev = 0u;
         bool shouldLog = false;
+        if (reg >= 1u && reg <= 4u)
+        {
+            if (!PS2IopTransport::readSifRegister(runtime, reg, prev) ||
+                !PS2IopTransport::writeSifRegisterFromEe(runtime, reg, value))
+            {
+                std::cerr << "[sceSifSetReg] IOP SIF register write failed for reg="
+                          << reg << std::endl;
+                setReturnS32(ctx, -1);
+                return;
+            }
+        }
+        else
         {
             std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
             auto it = g_sifRegs.find(reg);
@@ -774,6 +797,9 @@ namespace ps2_stubs
                 prev = it->second;
             }
             g_sifRegs[reg] = value;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
             shouldLog = shouldTraceSifReg(reg) && g_sifSetRegLogCount < 128u;
             if (shouldLog)
             {

@@ -239,6 +239,16 @@ namespace ps2x::iop
         return m_impl->emulator.writeMemory(address, source, size);
     }
 
+    bool IopSubsystem::readSifRegister(uint32_t index, uint32_t &value) const
+    {
+        return m_impl->emulator.readSifRegister(index, value);
+    }
+
+    bool IopSubsystem::writeSifRegisterFromEe(uint32_t index, uint32_t value)
+    {
+        return m_impl->emulator.writeSifRegisterFromEe(index, value);
+    }
+
     bool IopSubsystem::zeroMemory(uint32_t address, size_t size)
     {
         return m_impl->emulator.zeroMemory(address, size);

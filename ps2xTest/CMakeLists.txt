@@ -64,14 +64,27 @@ add_executable(ps2x_tests
     $<TARGET_OBJECTS:ps2_test_function_table>
 )
 
+add_executable(ps2x_sif_tests
+    src/sif_test_main.cpp
+    $<TARGET_OBJECTS:ps2_test_function_table>
+)
+
 option(PRINT_GENERATED_CODE "Print generated code in tests" OFF)
 if(PRINT_GENERATED_CODE)
 
     target_compile_definitions(ps2x_tests PRIVATE PRINT_GENERATED_CODE)
     target_compile_definitions(ps2_test_lib PRIVATE PRINT_GENERATED_CODE)
+    target_compile_definitions(ps2x_sif_tests PRIVATE PRINT_GENERATED_CODE)
 endif()
 
 target_include_directories(ps2x_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/ps2xRecomp/include
+    ${CMAKE_SOURCE_DIR}/ps2xAnalyzer/include
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+)
+
+target_include_directories(ps2x_sif_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/ps2xRecomp/include
     ${CMAKE_SOURCE_DIR}/ps2xAnalyzer/include
@@ -85,17 +98,31 @@ target_link_libraries(ps2x_tests PRIVATE
     ps2_runtime
 )
 
+target_link_libraries(ps2x_sif_tests PRIVATE
+    ps2_test_lib
+    ps2_recomp_lib
+    ps2_analyzer_lib
+    ps2_runtime
+)
+
+if(BUILD_TESTING)
+    add_test(NAME ps2x_sif_tests COMMAND ps2x_sif_tests)
+endif()
+
 # VU/GS tests intentionally instantiate large interpreter state.
 # Windows executables default to a much smaller stack than Linux, and
 # sanitizer/debug instrumentation can push these test frames over 1 MiB.
 if(MSVC)
     target_link_options(ps2x_tests PRIVATE "/STACK:8388608")
+    target_link_options(ps2x_sif_tests PRIVATE "/STACK:8388608")
 elseif(MINGW)
-    target_link_options(ps2x_tests PRIVATE "--stack,8388608")
+    target_link_options(ps2x_tests PRIVATE "-Wl,--stack,8388608")
+    target_link_options(ps2x_sif_tests PRIVATE "-Wl,--stack,8388608")
 endif()
 
 if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
     ps2x_stage_ffmpeg_runtime_dlls(ps2x_tests)
+    ps2x_stage_ffmpeg_runtime_dlls(ps2x_sif_tests)
 endif()
 
 include("${CMAKE_SOURCE_DIR}/ps2xRuntime/cmake/ReleaseMode.cmake")
@@ -103,4 +130,5 @@ include("${CMAKE_SOURCE_DIR}/ps2xRuntime/cmake/ReleaseMode.cmake")
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     EnableFastReleaseMode(ps2_test_lib)
     EnableFastReleaseMode(ps2x_tests)
+    EnableFastReleaseMode(ps2x_sif_tests)
 endif()

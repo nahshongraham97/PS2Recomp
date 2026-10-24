@@ -51,4 +51,22 @@ public:
             runtime->resetIop();
         }
     }
+
+    [[nodiscard]] static bool readSifRegister(
+        const PS2Runtime *runtime,
+        uint32_t index,
+        uint32_t &value)
+    {
+        return runtime && runtime->m_iopSubsystem &&
+               runtime->m_iopSubsystem->readSifRegister(index, value);
+    }
+
+    [[nodiscard]] static bool writeSifRegisterFromEe(
+        PS2Runtime *runtime,
+        uint32_t index,
+        uint32_t value)
+    {
+        return runtime && runtime->m_iopSubsystem &&
+               runtime->m_iopSubsystem->writeSifRegisterFromEe(index, value);
+    }
 };

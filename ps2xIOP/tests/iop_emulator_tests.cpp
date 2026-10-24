@@ -1,4 +1,5 @@
 #include "ps2x/iop/iop_subsystem.h"
+#include "emulator/core/iop_memory.h"
 
 #include <algorithm>
 #include <chrono>
@@ -893,6 +894,29 @@ namespace
 
 int main()
 {
+    detail::IopMemory sifMemory;
+    uint32_t sifFlag = UINT32_MAX;
+    if (!expect(sifMemory.readSifRegister(4u, sifFlag) && sifFlag == 0u,
+                "IOP reset must leave SMFLAG unset")) return 1;
+    if (!expect(!sifMemory.readSifRegister(5u, sifFlag),
+                "Invalid SIF register index must be rejected")) return 1;
+
+    sifMemory.write32(0x1D000030u, 0x00010000u);
+    sifMemory.write32(0x1D000030u, 0x00020000u);
+    if (!expect(sifMemory.readSifRegister(4u, sifFlag) && sifFlag == 0x00030000u,
+                "IOP SMFLAG writes must preserve previously published bits")) return 1;
+
+    if (!expect(sifMemory.writeSifRegisterFromEe(3u, 0x00030000u),
+                "EE MSFLAG write failed")) return 1;
+    sifMemory.write32(0x1D000020u, 0x00020000u);
+    if (!expect(sifMemory.readSifRegister(3u, sifFlag) && sifFlag == 0x00010000u,
+                "IOP MSFLAG write must clear acknowledged bits")) return 1;
+
+    if (!expect(sifMemory.writeSifRegisterFromEe(4u, 0x00020000u),
+                "EE SMFLAG write failed")) return 1;
+    if (!expect(sifMemory.readSifRegister(4u, sifFlag) && sifFlag == 0x00010000u,
+                "EE SMFLAG write must clear acknowledged bits")) return 1;
+
     TestHost host(0x20000u);
     IopSubsystem iop(host);
 

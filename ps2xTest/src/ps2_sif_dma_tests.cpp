@@ -63,6 +63,93 @@ namespace
     static_assert(sizeof(Ps2SifDmaTransfer) == 16u, "Unexpected Ps2SifDmaTransfer size.");
     static_assert(sizeof(SifRpcReceiveData) == 28u, "Unexpected SifRpcReceiveData size.");
 
+    #pragma pack(push, 1)
+    struct SifIrxElfHeader
+    {
+        uint8_t ident[16];
+        uint16_t type;
+        uint16_t machine;
+        uint32_t version;
+        uint32_t entry;
+        uint32_t phoff;
+        uint32_t shoff;
+        uint32_t flags;
+        uint16_t ehsize;
+        uint16_t phentsize;
+        uint16_t phnum;
+        uint16_t shentsize;
+        uint16_t shnum;
+        uint16_t shstrndx;
+    };
+
+    struct SifIrxProgramHeader
+    {
+        uint32_t type;
+        uint32_t offset;
+        uint32_t vaddr;
+        uint32_t paddr;
+        uint32_t filesz;
+        uint32_t memsz;
+        uint32_t flags;
+        uint32_t align;
+    };
+    #pragma pack(pop)
+
+    static_assert(sizeof(SifIrxElfHeader) == 52u);
+    static_assert(sizeof(SifIrxProgramHeader) == 32u);
+
+    bool writeSifFlagIrx(uint8_t *rdram, size_t rdramSize, uint32_t address)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00010000u;
+        const uint32_t code[] = {
+            0x3C081D00u, // lui   t0, 0x1D00
+            0x35080020u, // ori   t0, t0, 0x20 (IOP MSFLAG)
+            0x3C090002u, // lui   t1, 2
+            0xAD090000u, // sw    t1, 0(t0)
+            0x3C081D00u, // lui   t0, 0x1D00
+            0x35080030u, // ori   t0, t0, 0x30 (IOP SMFLAG)
+            0xAD090000u, // sw    t1, 0(t0)
+            0x00001021u, // addu  v0, zero, zero
+            0x03E00008u, // jr    ra
+            0x00000000u, // nop
+        };
+        if (!rdram || address > rdramSize || codeOffset + sizeof(code) > rdramSize - address)
+            return false;
+
+        SifIrxElfHeader header{};
+        header.ident[0] = 0x7Fu;
+        header.ident[1] = 'E';
+        header.ident[2] = 'L';
+        header.ident[3] = 'F';
+        header.ident[4] = 1u;
+        header.ident[5] = 1u;
+        header.ident[6] = 1u;
+        header.type = 2u;
+        header.machine = 8u;
+        header.version = 1u;
+        header.entry = loadAddress;
+        header.phoff = sizeof(header);
+        header.ehsize = sizeof(header);
+        header.phentsize = sizeof(SifIrxProgramHeader);
+        header.phnum = 1u;
+
+        SifIrxProgramHeader program{};
+        program.type = 1u;
+        program.offset = codeOffset;
+        program.vaddr = loadAddress;
+        program.paddr = loadAddress;
+        program.filesz = sizeof(code);
+        program.memsz = sizeof(code);
+        program.flags = 7u;
+        program.align = 4u;
+
+        std::memcpy(rdram + address, &header, sizeof(header));
+        std::memcpy(rdram + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(rdram + address + codeOffset, code, sizeof(code));
+        return true;
+    }
+
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
         ctx.r[reg] = _mm_set_epi64x(0, static_cast<int64_t>(value));
@@ -130,6 +217,90 @@ namespace
         ctx->pc = 0u;
         runtime->requestStop();
     }
+}
+
+void register_ps2_sif_register_tests()
+{
+    MiniTest::Case("PS2SifRegisters", [](TestCase &tc)
+    {
+        tc.Run("SIF register syscalls share IOP MMIO state", [](TestCase &t)
+        {
+            TestEnv env;
+
+            auto getReg = [&](uint32_t reg) -> uint32_t
+            {
+                setRegU32(env.ctx, 4, reg);
+                ps2_stubs::sceSifGetReg(env.rdram.data(), &env.ctx, &env.runtime);
+                return ::getRegU32(&env.ctx, 2);
+            };
+
+            t.Equals(getReg(0x1u), 0u, "SIF main-address register should default to zero");
+            t.Equals(getReg(0x2u), 0u, "SIF sub-address register should default to zero");
+            t.Equals(getReg(0x3u), 0u, "SIF MSFLAG should default to zero");
+            t.Equals(getReg(0x4u), 0u, "SIF SMFLAG should remain unset until IOP initialization writes it");
+
+            setRegU32(env.ctx, 4, 0x1u);
+            setRegU32(env.ctx, 5, 0x1234ABCDu);
+            ps2_stubs::sceSifSetReg(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegU32(&env.ctx, 2), 0u, "EE MAINADDR write should report the old value");
+            t.Equals(getReg(0x1u), 0x1234ABCDu, "MAINADDR getter should read the EE-written IOP register");
+
+            setRegU32(env.ctx, 4, 0x2u);
+            setRegU32(env.ctx, 5, 0x00007000u);
+            ps2_stubs::sceSifSetReg(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegU32(&env.ctx, 2), 0u, "EE SUBADDR write should report the old value");
+            t.Equals(getReg(0x2u), 0x00007000u, "SUBADDR getter should read the EE-written IOP register");
+
+            setRegU32(env.ctx, 4, 0x3u);
+            setRegU32(env.ctx, 5, 0x00030000u);
+            ps2_stubs::sceSifSetReg(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegU32(&env.ctx, 2), 0u, "EE MSFLAG write should report the old value");
+            t.Equals(getReg(0x3u), 0x00030000u, "EE MSFLAG write should set status bits");
+
+            constexpr uint32_t kIopIrxAddress = 0x00020000u;
+            t.IsTrue(env.runtime.memory().initialize(), "Runtime RDRAM should initialize for the IOP module fixture");
+            t.IsTrue(writeSifFlagIrx(env.runtime.memory().getRDRAM(), PS2_RAM_SIZE, kIopIrxAddress),
+                     "Could not write the synthetic IOP SIF publisher fixture");
+            const auto loaded = env.runtime.loadIopModuleBuffer(kIopIrxAddress);
+            t.IsTrue(loaded.handled && loaded.startResult == 0,
+                     "Synthetic IOP SIF module should execute and return success");
+            t.Equals(getReg(0x3u), 0x00010000u, "IOP MSFLAG write should clear acknowledged bits");
+            t.Equals(getReg(0x4u), 0x00020000u, "sceSifGetReg should read IOP-published SMFLAG");
+
+            setRegU32(env.ctx, 4, 0x4u);
+            setRegU32(env.ctx, 5, 0x00020000u);
+            ps2_stubs::sceSifSetReg(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegU32(&env.ctx, 2), 0x00020000u, "EE SMFLAG acknowledgment should report old state");
+            t.Equals(getReg(0x4u), 0u, "EE SMFLAG write should clear acknowledged bits");
+        });
+
+        tc.Run("sceSifExitCmd clears command state without altering SIF hardware", [](TestCase &t)
+        {
+            TestEnv env;
+
+            setRegU32(env.ctx, 4, 0x80000002u);
+            setRegU32(env.ctx, 5, 0x89ABCDEFu);
+            ps2_stubs::sceSifSetReg(env.rdram.data(), &env.ctx, &env.runtime);
+
+            setRegU32(env.ctx, 4, 0x3u);
+            setRegU32(env.ctx, 5, 0x00010000u);
+            ps2_stubs::sceSifSetReg(env.rdram.data(), &env.ctx, &env.runtime);
+
+            ps2_stubs::sceSifExitCmd(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), 0, "sceSifExitCmd should succeed");
+
+            auto getReg = [&](uint32_t reg) -> uint32_t
+            {
+                setRegU32(env.ctx, 4, reg);
+                ps2_stubs::sceSifGetReg(env.rdram.data(), &env.ctx, &env.runtime);
+                return ::getRegU32(&env.ctx, 2);
+            };
+
+            t.Equals(getReg(0x4u), 0u, "SMFLAG should remain unset without an IOP publisher");
+            t.Equals(getReg(0x3u), 0x00010000u, "sceSifExitCmd must not clear physical MSFLAG state");
+            t.Equals(getReg(0x80000002u), 0u, "sceSifExitCmd should clear transient custom SIF state");
+        });
+    });
 }
 
 void register_ps2_sif_dma_tests()
@@ -323,49 +494,6 @@ void register_ps2_sif_dma_tests()
             t.Equals(g_dmacHandlerLastCause, 5u, "DMAC handler should observe cause 5");
             t.Equals(g_dmacHandlerLastArg, kSchedulerSifDmaHandlerArg,
                      "DMAC handler should receive registered argument");
-        });
-
-        tc.Run("resetSifState seeds boot-ready SIF registers", [](TestCase &t)
-        {
-            TestEnv env;
-
-            auto getReg = [&](uint32_t reg) -> uint32_t
-            {
-                setRegU32(env.ctx, 4, reg);
-                ps2_stubs::sceSifGetReg(env.rdram.data(), &env.ctx, &env.runtime);
-                return ::getRegU32(&env.ctx, 2);
-            };
-
-            t.Equals(getReg(0x4u), 0x00020000u, "SIF boot status register should expose ready bit by default");
-            t.Equals(getReg(0x80000000u), 0u, "SIF main-address register should default to zero");
-            t.Equals(getReg(0x80000001u), 0u, "SIF sub-address register should default to zero");
-            t.Equals(getReg(0x80000002u), 0u, "SIF mscom register should default to zero");
-        });
-
-        tc.Run("sceSifExitCmd restores default boot-ready SIF registers", [](TestCase &t)
-        {
-            TestEnv env;
-
-            setRegU32(env.ctx, 4, 0x4u);
-            setRegU32(env.ctx, 5, 0x12340000u);
-            ps2_stubs::sceSifSetReg(env.rdram.data(), &env.ctx, &env.runtime);
-
-            setRegU32(env.ctx, 4, 0x80000002u);
-            setRegU32(env.ctx, 5, 0x89ABCDEFu);
-            ps2_stubs::sceSifSetReg(env.rdram.data(), &env.ctx, &env.runtime);
-
-            ps2_stubs::sceSifExitCmd(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), 0, "sceSifExitCmd should succeed");
-
-            auto getReg = [&](uint32_t reg) -> uint32_t
-            {
-                setRegU32(env.ctx, 4, reg);
-                ps2_stubs::sceSifGetReg(env.rdram.data(), &env.ctx, &env.runtime);
-                return ::getRegU32(&env.ctx, 2);
-            };
-
-            t.Equals(getReg(0x4u), 0x00020000u, "sceSifExitCmd should restore the boot-ready status bit");
-            t.Equals(getReg(0x80000002u), 0u, "sceSifExitCmd should clear transient mscom state");
         });
 
         tc.Run("sceSifSetDma rejects invalid descriptors without partial writes", [](TestCase &t)
