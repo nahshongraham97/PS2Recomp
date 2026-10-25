@@ -71,11 +71,20 @@ namespace
         int32_t memoryCard(const MemoryCardRequest &) override { return 0; }
         bool hasGuestFunction(uint32_t) const override { return false; }
         bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override { return false; }
+        void notifyEeSif0DmaComplete() override
+        {
+            ++sif0Notifications;
+            uint32_t observed = 0u;
+            if (readGuest(0xC00u, &observed, sizeof(observed)) && observed == 0x53494621u)
+                sif0PayloadVisibleAtNotification = true;
+        }
         void log(LogLevel, std::string_view message) override { logs.emplace_back(message); }
 
         std::vector<uint8_t> guest;
         std::vector<std::string> logs;
         std::string cdRoot;
+        uint32_t sif0Notifications = 0u;
+        bool sif0PayloadVisibleAtNotification = false;
     };
 
 #pragma pack(push, 1)
@@ -561,7 +570,7 @@ namespace
         std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
     }
 
-    void writeSifDmaIrx(TestHost &host, uint32_t address)
+    void writeSifDmaIrx(TestHost &host, uint32_t address, uint32_t attributes = 0u)
     {
         constexpr uint32_t codeOffset = 0x100u;
         constexpr uint32_t loadAddress = 0x00010000u;
@@ -600,7 +609,7 @@ namespace
             0u, 0u,
         };
         const uint32_t descriptor[] = {
-            payloadAddress, eeDestination, sizeof(uint32_t), 0u,
+            payloadAddress, eeDestination, sizeof(uint32_t), attributes,
         };
         constexpr uint32_t payload = 0x53494621u; // "SIF!"
 
@@ -1031,6 +1040,20 @@ int main()
                 "sceSifDmaStat did not report the synchronous transfer as complete")) return 1;
     if (!expect(sifDmaPayload == 0x53494621u,
                 "IOP sceSifSetDma did not copy the payload into EE memory")) return 1;
+    if (!expect(host.sif0Notifications == 0u,
+                "SIF0 interrupt fired for a transfer without SIF_DMA_INT_O")) return 1;
+
+    iop.reset();
+    host.sif0Notifications = 0u;
+    host.sif0PayloadVisibleAtNotification = false;
+    writeSifDmaIrx(host, 0x100u, 0x4u); // PS2SDK SIF_DMA_INT_O
+    const ModuleLoadResult sifDmaInterruptModule = iop.loadModuleBuffer(0x100u);
+    if (!expect(sifDmaInterruptModule.handled && sifDmaInterruptModule.startResult == -1,
+                "SIF DMA with output interrupt did not complete synchronously")) return 1;
+    if (!expect(host.sif0Notifications == 1u,
+                "SIF_DMA_INT_O did not notify the EE SIF0 completion path exactly once")) return 1;
+    if (!expect(host.sif0PayloadVisibleAtNotification,
+                "EE SIF0 completion was notified before the DMA payload reached guest memory")) return 1;
 
     iop.reset();
     writeVblankSchedulingIrx(host, 0x100u);

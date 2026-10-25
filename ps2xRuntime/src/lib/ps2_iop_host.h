@@ -83,6 +83,7 @@ public:
                              uint32_t a3,
                              uint32_t *resultAddress) override;
     bool sendSifCommand(uint32_t commandId, const void *packet, size_t packetSize) override;
+    void notifyEeSif0DmaComplete() override;
 
     void log(ps2x::iop::LogLevel level, std::string_view message) override;
 

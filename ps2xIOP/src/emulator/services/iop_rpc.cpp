@@ -55,7 +55,10 @@ namespace ps2x::iop::detail
                 uint32_t source = 0u;
                 uint32_t destination = 0u;
                 uint32_t size = 0u;
+                uint32_t attributes = 0u;
             };
+
+            constexpr uint32_t kSifDmaInterruptOutput = 0x4u;
 
             std::array<uint32_t, kMaxDescriptors * 4u> descriptorWords{};
             const size_t descriptorBytes = static_cast<size_t>(descriptorCount) * kDescriptorSize;
@@ -82,7 +85,8 @@ namespace ps2x::iop::detail
                     setV0(0u);
                     return true;
                 }
-                pending[pendingCount++] = {source, destination, size};
+                pending[pendingCount++] = {source, destination, size,
+                                           descriptorWords[i * 4u + 3u]};
                 largestTransfer = std::max(largestTransfer, size);
             }
 
@@ -108,6 +112,17 @@ namespace ps2x::iop::detail
                 {
                     setV0(0u);
                     return true;
+                }
+            }
+
+            // PS2SDK's SIF_DMA_INT_O (0x4) becomes the SIF tag's output
+            // interrupt bit. Deliver the EE SIF0 completion after all copies
+            // in this synchronous chain have reached guest memory.
+            for (uint32_t i = 0u; i < pendingCount; ++i)
+            {
+                if ((pending[i].attributes & kSifDmaInterruptOutput) != 0u)
+                {
+                    m_host.notifyEeSif0DmaComplete();
                 }
             }
 

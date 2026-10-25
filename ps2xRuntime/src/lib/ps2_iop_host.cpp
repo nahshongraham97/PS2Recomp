@@ -8,6 +8,7 @@
 #include "Kernel/Syscalls/Common.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -515,6 +516,18 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
                                          commandId,
                                          packet,
                                          packetSize);
+}
+
+void PS2IopHostAdapter::notifyEeSif0DmaComplete()
+{
+    if (std::getenv("PS2X_SIF_TRACE_DATA") != nullptr)
+    {
+        std::cerr << "[SIF0_DMA_COMPLETE] IOP->EE bytes committed; queue EE DMAC_SIF0" << std::endl;
+    }
+    // DMAC_SIF0 is channel/cause 5 in the EE kernel API. dispatchIrq queues
+    // the registered guest handler on the EE scheduler; it does not invoke it
+    // reentrantly while the IOP is copying the DMA chain.
+    m_runtime.eeScheduler().dispatchIrq(true, 5u);
 }
 
 void PS2IopHostAdapter::log(ps2x::iop::LogLevel level, std::string_view message)
