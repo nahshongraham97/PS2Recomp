@@ -131,5 +131,10 @@ namespace ps2x::iop
         }
 
         virtual void log(LogLevel level, std::string_view message) = 0;
+
+        // Appended after the existing interface to preserve vtable slots for
+        // the original IOP host ABI. The runtime delivers DMAC_SIF0 only after
+        // the destination bytes have been committed to guest memory.
+        virtual void notifyEeSif0DmaComplete() {}
     };
 }
