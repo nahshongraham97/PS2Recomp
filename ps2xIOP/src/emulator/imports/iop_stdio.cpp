@@ -4,6 +4,9 @@
 #include "../core/iop_memory.h"
 #include "ps2x/iop/iop_host.h"
 
+#include <cstdlib>
+#include <iomanip>
+#include <sstream>
 #include <string>
 
 namespace ps2x::iop::detail
@@ -31,8 +34,31 @@ namespace ps2x::iop::detail
         switch (ordinal)
         {
         case 4: // printf
+        {
+            if (std::getenv("PS2X_IOP_STDIO_TRACE_ARGS") != nullptr)
+            {
+                const std::string format = m_memory.readString(a0, 2048u);
+                std::ostringstream trace;
+                trace << "[IOP_PRINTF_ARGS] format=\"" << format << '\"';
+                if (format.find("open fail name %s") != std::string::npos)
+                {
+                    trace << " name_ptr=0x" << std::hex << a1 << std::dec
+                          << " name=\"" << m_memory.readString(a1, 260u) << '\"';
+                    m_host.log(LogLevel::Info, trace.str());
+                }
+                else if (format.find("loadmodule: fname %s") != std::string::npos)
+                {
+                    trace << " filename_ptr=0x" << std::hex << a1
+                          << " arg_count=" << std::dec << cpu.gpr[6]
+                          << " arg_ptr=0x" << std::hex << cpu.gpr[7] << std::dec
+                          << " filename=\"" << m_memory.readString(a1, 260u)
+                          << "\" arg=\"" << m_memory.readString(cpu.gpr[7], 260u) << '\"';
+                    m_host.log(LogLevel::Info, trace.str());
+                }
+            }
             logString("[IOP printf] ", a0);
             return true;
+        }
         case 5: // getchar
         case 10:
             setV0(0xFFFFFFFFu);

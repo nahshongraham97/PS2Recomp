@@ -150,6 +150,91 @@ namespace ps2x::iop
         return m_impl->emulator.loadModuleBuffer(guestAddress, arguments, argumentSize);
     }
 
+    ModuleLoadResult IopSubsystem::loadModuleScheduled(std::string_view path,
+                                                       const void *arguments,
+                                                       uint32_t argumentSize)
+    {
+        const ParsedPs2Path parsed = parsePs2Path(path);
+        if (!parsed)
+            return {true, -1, -1, false};
+
+        if (parsed.device != Ps2PathDevice::Rom0)
+        {
+            ModuleLoadResult physical = m_impl->emulator.loadModuleScheduled(path, arguments, argumentSize);
+            if (physical.moduleId > 0)
+            {
+                m_impl->moduleManager.observePhysicalLoad(physical.moduleId, path);
+                m_impl->rebuildRoutes();
+                return physical;
+            }
+        }
+
+        // HLE providers have no guest module_start to schedule. Preserve the
+        // existing explicit provider behavior as an immediate completed load.
+        ModuleLoadResult hle = m_impl->moduleManager.loadHle(path);
+        if (hle.moduleId > 0)
+        {
+            m_impl->rebuildRoutes();
+            if (parsed.device != Ps2PathDevice::Rom0)
+                m_impl->recordLoadOutcome(path, true);
+        }
+        else
+        {
+            m_impl->recordLoadOutcome(path, false);
+        }
+        return hle;
+    }
+
+    ModuleLoadResult IopSubsystem::loadModuleBufferScheduled(uint32_t guestAddress,
+                                                             const void *arguments,
+                                                             uint32_t argumentSize)
+    {
+        return m_impl->emulator.loadModuleBufferScheduled(guestAddress, arguments, argumentSize);
+    }
+
+    ModuleLoadResult IopSubsystem::loadRomDirModuleScheduled(std::string_view imagePath,
+                                                             std::string_view moduleName,
+                                                             const void *arguments,
+                                                             uint32_t argumentSize)
+    {
+        ModuleLoadResult physical = m_impl->emulator.loadRomDirModuleScheduled(imagePath, moduleName,
+                                                                                arguments, argumentSize);
+        if (physical.moduleId > 0)
+        {
+            m_impl->moduleManager.observePhysicalLoad(physical.moduleId, moduleName);
+            m_impl->rebuildRoutes();
+        }
+        return physical;
+    }
+
+    IopModuleStartState IopSubsystem::moduleStartState(int32_t moduleId)
+    {
+        return m_impl->emulator.moduleStartState(moduleId);
+    }
+
+    IopCallResult IopSubsystem::callExport(std::string_view library, uint16_t ordinal,
+                                            uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                            uint32_t instructionBudget)
+    {
+        return m_impl->emulator.callExport(library, ordinal, a0, a1, a2, a3, instructionBudget);
+    }
+
+    IopScheduledCall IopSubsystem::scheduleExportCall(std::string_view library, uint16_t ordinal,
+                                                       uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3)
+    {
+        return m_impl->emulator.scheduleExportCall(library, ordinal, a0, a1, a2, a3);
+    }
+
+    IopScheduledCallState IopSubsystem::scheduledCallState(uint32_t callId) const
+    {
+        return m_impl->emulator.scheduledCallState(callId);
+    }
+
+    bool IopSubsystem::releaseScheduledCall(uint32_t callId)
+    {
+        return m_impl->emulator.releaseScheduledCall(callId);
+    }
+
     bool IopSubsystem::stopModule(int32_t moduleId, int32_t *result)
     {
         if (m_impl->moduleManager.stopHle(moduleId, result))
@@ -247,6 +332,21 @@ namespace ps2x::iop
     bool IopSubsystem::writeSifRegisterFromEe(uint32_t index, uint32_t value)
     {
         return m_impl->emulator.writeSifRegisterFromEe(index, value);
+    }
+
+    bool IopSubsystem::writeSifRegisterFromIop(uint32_t index, uint32_t value)
+    {
+        return m_impl->emulator.writeSifRegisterFromIop(index, value);
+    }
+
+    bool IopSubsystem::prepareCdvdDeviceState()
+    {
+        return m_impl->emulator.prepareCdvdDeviceState();
+    }
+
+    bool IopSubsystem::setRom0Image(std::span<const uint8_t> image)
+    {
+        return m_impl->emulator.setRom0Image(image);
     }
 
     bool IopSubsystem::zeroMemory(uint32_t address, size_t size)

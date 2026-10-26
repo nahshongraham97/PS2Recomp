@@ -4,6 +4,7 @@
 #include "ps2x/iop/iop_subsystem.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -13,6 +14,9 @@ namespace ps2x::iop::detail
     namespace
     {
         constexpr uint32_t kMaxImageSize = 64u * 1024u * 1024u;
+        constexpr uint32_t kMaxRomDirImageSize = 8u * 1024u * 1024u;
+        constexpr uint32_t kRomDirRecordSize = 16u;
+        constexpr uint32_t kRomDirScanLimit = 8u * 1024u * 1024u;
         constexpr uint32_t kModuleLoadBase = 0x00010000u;
 
         constexpr uint16_t ET_EXEC = 2;
@@ -128,6 +132,28 @@ namespace ps2x::iop::detail
         bool checkedRange(size_t total, uint32_t offset, uint32_t size)
         {
             return offset <= total && size <= total - offset;
+        }
+
+        uint32_t readLe32(std::span<const uint8_t> bytes, size_t offset)
+        {
+            return static_cast<uint32_t>(bytes[offset]) |
+                   (static_cast<uint32_t>(bytes[offset + 1u]) << 8u) |
+                   (static_cast<uint32_t>(bytes[offset + 2u]) << 16u) |
+                   (static_cast<uint32_t>(bytes[offset + 3u]) << 24u);
+        }
+
+        bool asciiIEquals(std::string_view lhs, std::string_view rhs)
+        {
+            if (lhs.size() != rhs.size())
+                return false;
+            for (size_t i = 0; i < lhs.size(); ++i)
+            {
+                const auto a = static_cast<unsigned char>(lhs[i]);
+                const auto b = static_cast<unsigned char>(rhs[i]);
+                if (std::tolower(a) != std::tolower(b))
+                    return false;
+            }
+            return true;
         }
 
         bool validElfHeader(const Elf32Ehdr &header)
@@ -318,6 +344,58 @@ namespace ps2x::iop::detail
         const bool ok = host.readHostFile(handle, 0u, bytes.data(), bytes.size(), bytesRead) && bytesRead == bytes.size();
         host.closeHostFile(handle);
         return ok;
+    }
+
+    bool IopModuleLoader::extractRomDirModule(std::span<const uint8_t> image,
+                                              std::string_view moduleName,
+                                              std::vector<uint8_t> &module)
+    {
+        module.clear();
+        if (image.size() > kMaxRomDirImageSize || moduleName.empty())
+            return false;
+
+        const size_t scanEnd = std::min(image.size(), static_cast<size_t>(kRomDirScanLimit));
+        size_t directoryOffset = image.size();
+        for (size_t offset = 0u; offset + kRomDirRecordSize <= scanEnd; offset += kRomDirRecordSize)
+        {
+            if (std::memcmp(image.data() + offset, "RESET\0", 6u) == 0)
+            {
+                directoryOffset = offset;
+                break;
+            }
+        }
+        if (directoryOffset == image.size())
+            return false;
+
+        size_t cursor = directoryOffset;
+        size_t dataOffset = 0u;
+        while (cursor + kRomDirRecordSize <= image.size())
+        {
+            const uint8_t *const record = image.data() + cursor;
+            if (record[0] == 0u)
+                return false;
+            const auto nameEnd = std::find(record, record + 10u, uint8_t{0});
+            if (nameEnd == record + 10u)
+                return false;
+            const std::string_view name(reinterpret_cast<const char *>(record),
+                                        static_cast<size_t>(nameEnd - record));
+            const uint32_t fileSize = readLe32(image, cursor + 12u);
+            if (dataOffset > image.size() || fileSize > image.size() - dataOffset)
+                return false;
+            if (asciiIEquals(name, moduleName))
+            {
+                module.assign(image.begin() + static_cast<std::ptrdiff_t>(dataOffset),
+                              image.begin() + static_cast<std::ptrdiff_t>(dataOffset + fileSize));
+                return !module.empty();
+            }
+
+            const uint64_t alignedEnd = (static_cast<uint64_t>(dataOffset) + fileSize + 15u) & ~uint64_t{15u};
+            if (alignedEnd > image.size())
+                return false;
+            dataOffset = static_cast<size_t>(alignedEnd);
+            cursor += kRomDirRecordSize;
+        }
+        return false;
     }
 
     bool IopModuleLoader::readElfFromGuest(IopHost &host, uint32_t guestAddress, std::vector<uint8_t> &bytes)

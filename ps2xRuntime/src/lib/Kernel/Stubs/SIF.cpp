@@ -6,6 +6,7 @@
 #include "runtime/ee_scheduler.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -666,6 +667,34 @@ namespace ps2_stubs
                           << " pc=0x" << ctx->pc
                           << " ra=0x" << getRegU32(ctx, 31)
                           << std::dec << std::endl;
+                if (std::getenv("PS2X_SIF_TRACE_DATA"))
+                {
+                    uint32_t commandId = 0u;
+                    if (size >= 12u)
+                    {
+                        const uint8_t *commandBytes = getConstMemPtr(rdram, src + 8u);
+                        if (commandBytes)
+                            std::memcpy(&commandId, commandBytes, sizeof(commandId));
+                    }
+                    const bool isResetCommand = commandId == 0x80000003u && size >= 0x18u;
+                    std::cerr << (isResetCommand ? "[sceSifSetDma:RESET_PACKET] i=" : "[sceSifSetDma:DATA] i=")
+                              << i << " src=0x" << std::hex << src << " size=0x" << size << " bytes=";
+                    const uint32_t previewSize = std::min<uint32_t>(size, isResetCommand ? 0x68u : 32u);
+                    for (uint32_t byteIndex = 0u; byteIndex < previewSize; ++byteIndex)
+                    {
+                        const uint8_t *byte = getConstMemPtr(rdram, src + byteIndex);
+                        if (!byte)
+                        {
+                            std::cerr << "??";
+                            break;
+                        }
+                        const unsigned value = *byte;
+                        if (value < 16u)
+                            std::cerr << '0';
+                        std::cerr << value;
+                    }
+                    std::cerr << std::dec << std::endl;
+                }
             }
         });
 

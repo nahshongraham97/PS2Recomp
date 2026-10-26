@@ -35,7 +35,10 @@ namespace ps2_syscalls
                                               getRegU32(ctx, 6) != 0u,
                                               getRegU32(ctx, 7),
                                               getRegU32(ctx, 28),
-                                              getRegU32(ctx, 29));
+                                              // Add*Intc/DmacHandler2's fourth argument is user data,
+                                              // not a callback stack. These syscalls have no stack
+                                              // parameter; let dispatchIrq use the interrupted SP.
+                                              0u);
             setReturnS32(ctx, id);
         }
 

@@ -32,6 +32,10 @@ namespace ps2x::iop::detail
         IopCdvd &operator=(const IopCdvd &) = delete;
 
         void reset() noexcept;
+        [[nodiscard]] bool prepareDeviceState();
+        // Services guest-programmed CDVD MMIO commands and channel-3 DMA.
+        // Returns true when a device completion should raise IOP IRQ 2.
+        [[nodiscard]] bool serviceDevice();
 
         [[nodiscard]] bool dispatchImport(uint16_t ordinal, IopCpuState &cpu);
         [[nodiscard]] std::optional<CompletionCallback> takeCompletionCallback() noexcept;

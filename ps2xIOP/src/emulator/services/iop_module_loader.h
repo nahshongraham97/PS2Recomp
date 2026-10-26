@@ -43,6 +43,9 @@ namespace ps2x::iop::detail
     public:
         [[nodiscard]] static bool readWholeHostFile(IopHost &host, std::string_view guestPath, std::vector<uint8_t> &bytes);
         [[nodiscard]] static bool readElfFromGuest(IopHost &host, uint32_t guestAddress, std::vector<uint8_t> &bytes);
+        [[nodiscard]] static bool extractRomDirModule(std::span<const uint8_t> image,
+                                                      std::string_view moduleName,
+                                                      std::vector<uint8_t> &module);
         [[nodiscard]] static IopImageLoadResult load(std::span<const uint8_t> image, IopMemory &memory, uint32_t moduleCursor);
     };
 }

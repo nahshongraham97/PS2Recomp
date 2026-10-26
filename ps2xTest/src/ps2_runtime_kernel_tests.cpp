@@ -183,9 +183,19 @@ namespace
     constexpr uint32_t K_EXIT_HANDLER_A = 0x300610u;
     constexpr uint32_t K_EXIT_HANDLER_B = 0x300620u;
     constexpr uint32_t K_EXIT_OBSERVER = 0x300630u;
+    constexpr uint32_t K_IRQ_STACK_MAIN = 0x300700u;
+    constexpr uint32_t K_IRQ_STACK_HANDLER = 0x300710u;
+    constexpr uint32_t K_IRQ_STACK_CAUSE = 5u;
+    constexpr uint32_t K_IRQ_REGISTRATION_SP = 0x18060u;
+    constexpr uint32_t K_IRQ_INTERRUPTED_SP = 0x18000u;
+    constexpr uint32_t K_IRQ_SAVED_RA_SLOT = K_IRQ_INTERRUPTED_SP + 0x20u;
+    constexpr uint64_t K_IRQ_SAVED_RA_SENTINEL = 0x0123456789ABCDEFull;
     uint32_t gOverrideSyscall = 0u;
     R5900Context gOverrideResult{};
     std::vector<int> gInvocationTrace;
+    uint32_t gIrqCallbackEntrySp = 0u;
+    uint32_t gIrqCallbackCount = 0u;
+    int32_t gIrqRegistrationResult = KE_ERROR;
 
     void schedulerOverrideEntry(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -279,6 +289,39 @@ namespace
         ExitThread(rdram, ctx, runtime);
     }
 
+    void schedulerIrqStackMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setRegU32(*ctx, 4, K_IRQ_STACK_CAUSE);
+        setRegU32(*ctx, 5, K_IRQ_STACK_HANDLER);
+        setRegU32(*ctx, 6, 0u);
+        setRegU32(*ctx, 7, 0xA55Au);
+        setRegU32(*ctx, 29, K_IRQ_REGISTRATION_SP);
+        gIrqRegistrationResult = callSyscall(0x12u, rdram, ctx, runtime)
+                                     ? getRegS32(*ctx, 2)
+                                     : KE_ERROR;
+
+        setRegU32(*ctx, 29, K_IRQ_INTERRUPTED_SP);
+        runtime->eeScheduler().setIrqCauseEnabled(true, K_IRQ_STACK_CAUSE, true);
+        runtime->eeScheduler().dispatchIrq(true, K_IRQ_STACK_CAUSE);
+        ctx->pc = 0u;
+    }
+
+    void schedulerIrqStackHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ++gIrqCallbackCount;
+        gIrqCallbackEntrySp = getRegU32(ctx, 29);
+
+        // This matches the retail handler's observed prologue operations:
+        // addiu $sp, $sp, -0xA0; sd $s6, 0x60($sp).
+        const uint32_t frameSp = gIrqCallbackEntrySp - 0xA0u;
+        setRegU32(*ctx, 29, frameSp);
+        const uint64_t savedS6 = static_cast<uint64_t>(_mm_extract_epi64(ctx->r[22], 0));
+        std::memcpy(rdram + frameSp + 0x60u, &savedS6, sizeof(savedS6));
+
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
     void alarmNoopHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
     {
         ctx->pc = 0u;
@@ -357,6 +400,22 @@ namespace
         gSchedulerTrace->push_back(20);
         ctx->pc = 0u;
         if (gSchedulerTrace->size() >= 4u)
+        {
+            runtime->requestStop();
+        }
+    }
+
+    void schedulerTracePriorityZero(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        gSchedulerTrace->push_back(5);
+        ctx->pc = 0u;
+    }
+
+    void schedulerTracePriorityFive(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gSchedulerTrace->push_back(10);
+        ctx->pc = 0u;
+        if (gSchedulerTrace->size() >= 3u)
         {
             runtime->requestStop();
         }
@@ -605,6 +664,36 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(thread->option, threadParam.option, "option must be decoded from offset 0x20");
             t.IsTrue(thread->status == EeThreadStatus::Dormant, "a newly created EE thread must be dormant");
 
+            EeThreadCreateAbi highestPriorityParam{};
+            highestPriorityParam.func = K_SCHED_HIGH;
+            highestPriorityParam.stack = 0x00019000u;
+            highestPriorityParam.stack_size = 0x800;
+            highestPriorityParam.gp_reg = 0x00123400u;
+            highestPriorityParam.initial_priority = 0;
+            highestPriorityParam.current_priority = 1;
+            std::memcpy(env.rdram.data() + K_PARAM_ADDR, &highestPriorityParam,
+                        sizeof(highestPriorityParam));
+            env.runtime.registerFunction(K_SCHED_HIGH, schedulerTraceA);
+            setRegU32(env.ctx, 4, K_PARAM_ADDR);
+            CreateThread(env.rdram.data(), &env.ctx, &env.runtime);
+            const int highestPriorityId = getRegS32(env.ctx, 2);
+            const GuestThread *highestPriorityThread =
+                env.runtime.eeScheduler().thread(highestPriorityId);
+            t.IsTrue(highestPriorityId >= 2 && highestPriorityThread != nullptr,
+                     "priority zero is a valid EE CreateThread priority");
+            if (highestPriorityThread)
+            {
+                t.Equals(highestPriorityThread->initialPriority, 0,
+                         "CreateThread must preserve the valid highest priority");
+            }
+            setRegU32(env.ctx, 4, static_cast<uint32_t>(highestPriorityId));
+            setRegU32(env.ctx, 5, 0xCAFEu);
+            StartThread(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), KE_OK,
+                     "StartThread must start a thread created at priority zero");
+            t.IsTrue(highestPriorityThread && highestPriorityThread->status == EeThreadStatus::Ready,
+                     "the priority-zero thread must enter the ready queue");
+
             setRegU32(env.ctx, 4, PS2_RAM_SIZE - static_cast<uint32_t>(sizeof(EeThreadCreateAbi)) + 4u);
             CreateThread(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegS32(env.ctx, 2), KE_ERROR,
@@ -666,6 +755,40 @@ void register_ps2_runtime_kernel_tests()
                       "all EE guest functions must execute on the single scheduler host thread");
             t.IsFalse(gGuestExecutingFlagMissing.load(std::memory_order_acquire),
                       "the scheduler must publish guest execution only around the active guest call");
+        });
+
+        tc.Run("priority zero is highest and runnable before priority five", [](TestCase &t)
+        {
+            TestEnv env;
+            std::vector<int> trace;
+            gSchedulerTrace = &trace;
+            gGuestActive.store(0, std::memory_order_release);
+            gGuestMaxActive.store(0, std::memory_order_release);
+            gGuestExecutorHash.store(0u, std::memory_order_release);
+            gGuestExecutorMismatch.store(false, std::memory_order_release);
+            gGuestExecutingFlagMissing.store(false, std::memory_order_release);
+            env.runtime.registerFunction(K_SCHED_MAIN, schedulerMainExit);
+            env.runtime.registerFunction(K_SCHED_A, schedulerTracePriorityFive);
+            env.runtime.registerFunction(K_SCHED_B, schedulerTracePriorityZero);
+
+            env.ctx.pc = K_SCHED_MAIN;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+            const int highest = ee.createThread(
+                EeThreadCreateParams{0u, K_SCHED_B, 0x23000u, 0x800u, 0u, 0, 0u});
+            const int normal = ee.createThread(
+                EeThreadCreateParams{0u, K_SCHED_A, 0x24000u, 0x800u, 0u, 5, 0u});
+            t.IsTrue(highest >= 2 && normal >= 2,
+                     "priority zero and ordinary priorities should both create");
+            t.Equals(ee.startThread(highest, 0u, env.ctx, false), KE_OK,
+                     "priority-zero thread should start");
+            t.Equals(ee.startThread(normal, 0u, env.ctx, false), KE_OK,
+                     "priority-five thread should start");
+            ee.run();
+
+            const std::vector<int> expected{1, 5, 10};
+            t.IsTrue(trace == expected,
+                     "the priority-zero thread must run before the priority-five thread");
         });
 
         tc.Run("thread lifecycle, nested suspend, WAIT-SUSPEND, and wakeup count are centralized", [](TestCase &t)
@@ -1511,6 +1634,39 @@ void register_ps2_runtime_kernel_tests()
             const std::vector<int> expected{10, 20, 30, 40};
             t.IsTrue(gInvocationTrace == expected,
                      "exit handlers should retain registration order and complete before another guest thread observes dormancy");
+        });
+
+        tc.Run("IRQ syscall uses the interrupted stack instead of registration-time SP", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(K_IRQ_STACK_MAIN, schedulerIrqStackMain);
+            env.runtime.registerFunction(K_IRQ_STACK_HANDLER, schedulerIrqStackHandler);
+
+            gIrqCallbackEntrySp = 0u;
+            gIrqCallbackCount = 0u;
+            gIrqRegistrationResult = KE_ERROR;
+            std::memcpy(env.rdram.data() + K_IRQ_SAVED_RA_SLOT,
+                        &K_IRQ_SAVED_RA_SENTINEL,
+                        sizeof(K_IRQ_SAVED_RA_SENTINEL));
+
+            R5900Context mainContext{};
+            mainContext.pc = K_IRQ_STACK_MAIN;
+            setRegU32(mainContext, 29, K_IRQ_REGISTRATION_SP);
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            uint64_t savedRa = 0u;
+            std::memcpy(&savedRa,
+                        env.rdram.data() + K_IRQ_SAVED_RA_SLOT,
+                        sizeof(savedRa));
+            t.Equals(gIrqRegistrationResult, 1,
+                     "AddDmacHandler should register the guest handler");
+            t.Equals(gIrqCallbackCount, 1u,
+                     "the enabled IRQ should invoke the registered callback once");
+            t.Equals(gIrqCallbackEntrySp, K_IRQ_INTERRUPTED_SP,
+                     "the callback should start from the interrupted context SP, not the SP at registration");
+            t.Equals(savedRa, K_IRQ_SAVED_RA_SENTINEL,
+                     "the handler's stack prologue must not overwrite the interrupted caller's saved frame");
         });
 
         tc.Run("Copy syscall (0x5A) performs a memory copy", [](TestCase &t)

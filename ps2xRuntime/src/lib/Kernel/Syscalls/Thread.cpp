@@ -2,10 +2,19 @@
 #include "Thread.h"
 #include "runtime/ee_scheduler.h"
 
+#include <cstdlib>
+#include <iostream>
+
 namespace ps2_syscalls
 {
     namespace
     {
+        bool eeThreadTraceEnabled()
+        {
+            const char *value = std::getenv("PS2X_EE_THREAD_TRACE");
+            return value && value[0] == '1';
+        }
+
         EeScheduler &scheduler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         {
             EeScheduler &result = runtime->eeScheduler();
@@ -112,6 +121,13 @@ namespace ps2_syscalls
             const int priority = static_cast<int>(getRegU32(ctx, 5));
             int oldPriority = 0;
             const int result = ee.changePriority(id, priority, interruptSafe, oldPriority);
+            if (eeThreadTraceEnabled())
+            {
+                std::cerr << "[EE_THREAD_TRACE] ChangeThreadPriority pc=0x" << std::hex
+                          << getRegU32(ctx, 31) << std::dec << " id=" << id
+                          << " priority=" << priority << " result=" << result
+                          << " old=" << oldPriority << std::endl;
+            }
             setReturnS32(ctx, result);
             ee.transferIfRequested(interruptSafe);
         }
@@ -230,7 +246,18 @@ namespace ps2_syscalls
             param->initial_priority,
             param->option,
         };
-        setReturnS32(ctx, scheduler(rdram, ctx, runtime).createThread(decoded));
+        const int result = scheduler(rdram, ctx, runtime).createThread(decoded);
+        if (eeThreadTraceEnabled())
+        {
+            std::cerr << "[EE_THREAD_TRACE] CreateThread pc=0x" << std::hex << getRegU32(ctx, 31)
+                      << " desc=0x" << address << " entry=0x" << decoded.entry
+                      << " stack=0x" << decoded.stack << " stack_size=0x" << decoded.stackSize
+                      << " gp=0x" << decoded.gp << std::dec
+                      << " initial_priority=" << decoded.priority
+                      << " attr=0x" << std::hex << decoded.attr << " option=0x" << decoded.option
+                      << std::dec << " result=" << result << std::endl;
+        }
+        setReturnS32(ctx, result);
     }
 
     void DeleteThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -255,19 +282,35 @@ namespace ps2_syscalls
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
         const int id = static_cast<int>(getRegU32(ctx, 4));
         const uint32_t arg = getRegU32(ctx, 5);
+        const auto traceStart = [&](int result, const char *reason)
+        {
+            if (eeThreadTraceEnabled())
+            {
+                const GuestThread *traceTarget = ee.thread(id);
+                std::cerr << "[EE_THREAD_TRACE] StartThread pc=0x" << std::hex << getRegU32(ctx, 31)
+                          << std::dec << " id=" << id << " arg=0x" << std::hex << arg << std::dec
+                          << " result=" << result << " reason=" << reason
+                          << " status=" << (traceTarget ? rawThreadStatus(traceTarget->status) : -1)
+                          << " entry=0x" << std::hex << (traceTarget ? traceTarget->entry : 0u)
+                          << std::dec << std::endl;
+            }
+        };
         GuestThread *target = ee.thread(id);
         if (!target)
         {
+            traceStart(KE_UNKNOWN_THID, "unknown_thread");
             setReturnS32(ctx, KE_UNKNOWN_THID);
             return;
         }
         if (target->status != EeThreadStatus::Dormant)
         {
+            traceStart(KE_NOT_DORMANT, "not_dormant");
             setReturnS32(ctx, KE_NOT_DORMANT);
             return;
         }
         if (!runtime->hasFunction(target->entry))
         {
+            traceStart(KE_ERROR, "unregistered_entry");
             setReturnS32(ctx, KE_ERROR);
             return;
         }
@@ -276,12 +319,14 @@ namespace ps2_syscalls
             target->stack = runtime->guestMalloc(target->stackSize, 16u);
             if (target->stack == 0u)
             {
+                traceStart(KE_ERROR, "guest_stack_allocation_failed");
                 setReturnS32(ctx, KE_ERROR);
                 return;
             }
             target->ownsStack = true;
         }
         const int result = ee.startThread(id, arg, *ctx, false);
+        traceStart(result, result == KE_OK ? "queued" : "scheduler_rejected");
         setReturnS32(ctx, result);
         ee.transferIfRequested(false);
     }

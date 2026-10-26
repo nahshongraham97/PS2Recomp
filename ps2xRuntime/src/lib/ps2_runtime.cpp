@@ -23,13 +23,45 @@
 #include <limits>
 #include <chrono>
 #include <atomic>
+#include <functional>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <sstream>
+#include <cstdlib>
+
+#if defined(PS2X_ARMAGEDDON_RELOCATIONS)
+#include "relocations.h"
+#endif
 
 namespace ps2_stubs
 {
     void resetSifState();
+}
+
+namespace
+{
+    std::atomic<bool> g_armageddonHostRebootAttempted{false};
+    std::mutex g_armageddonHostRebootMutex;
+    PS2Runtime *g_pendingArmageddonHostRebootOwner = nullptr;
+    std::function<void()> g_pendingArmageddonHostReboot;
+}
+
+void runPendingArmageddonHostReboot(PS2Runtime *runtime)
+{
+    std::function<void()> pending;
+    {
+        std::lock_guard<std::mutex> lock(g_armageddonHostRebootMutex);
+        if (runtime && runtime == g_pendingArmageddonHostRebootOwner)
+        {
+            pending = std::move(g_pendingArmageddonHostReboot);
+            g_pendingArmageddonHostRebootOwner = nullptr;
+        }
+    }
+    if (pending)
+    {
+        pending();
+    }
 }
 
 #define ELF_MAGIC 0x464C457F // "\x7FELF" in little endian
@@ -576,6 +608,57 @@ ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBuffer(uint32_t guestAddres
     return m_iopSubsystem->loadModuleBuffer(guestAddress, arguments, argumentSize);
 }
 
+ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleScheduled(std::string_view path,
+                                                               const void *arguments,
+                                                               uint32_t argumentSize)
+{
+    auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
+    return m_iopSubsystem->loadModuleScheduled(path, arguments, argumentSize);
+}
+
+ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBufferScheduled(uint32_t guestAddress,
+                                                                      const void *arguments,
+                                                                      uint32_t argumentSize)
+{
+    auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
+    return m_iopSubsystem->loadModuleBufferScheduled(guestAddress, arguments, argumentSize);
+}
+
+ps2x::iop::ModuleLoadResult PS2Runtime::loadIopRomDirModuleScheduled(std::string_view imagePath,
+                                                                     std::string_view moduleName,
+                                                                     const void *arguments,
+                                                                     uint32_t argumentSize)
+{
+    auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
+    return m_iopSubsystem->loadRomDirModuleScheduled(imagePath, moduleName, arguments, argumentSize);
+}
+
+ps2x::iop::IopModuleStartState PS2Runtime::iopModuleStartState(int32_t moduleId)
+{
+    return m_iopSubsystem->moduleStartState(moduleId);
+}
+
+ps2x::iop::IopScheduledCall PS2Runtime::scheduleIopExportCall(std::string_view library,
+                                                              uint16_t ordinal,
+                                                              uint32_t a0,
+                                                              uint32_t a1,
+                                                              uint32_t a2,
+                                                              uint32_t a3)
+{
+    auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
+    return m_iopSubsystem->scheduleExportCall(library, ordinal, a0, a1, a2, a3);
+}
+
+ps2x::iop::IopScheduledCallState PS2Runtime::iopScheduledCallState(uint32_t callId) const
+{
+    return m_iopSubsystem->scheduledCallState(callId);
+}
+
+bool PS2Runtime::releaseIopScheduledCall(uint32_t callId)
+{
+    return m_iopSubsystem->releaseScheduledCall(callId);
+}
+
 bool PS2Runtime::stopIopModule(int32_t moduleId, int32_t *result)
 {
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
@@ -603,6 +686,350 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
 {
     auto scope = m_iopHost->enterCall(nullptr, rdram);
     m_iopSubsystem->onSifTransfer(transfer);
+
+    // Explicit experiment: replace only the reboot-loader work after the real
+    // Armageddon reset packet has crossed SIF1. This profile does not alter the
+    // default guest path and never publishes BOOTEND unless every selected
+    // original IRX module_start has returned successfully.
+    const char *const hostRebootProfile = std::getenv("PS2X_ARMAGEDDON_HOST_REBOOT");
+    if (!hostRebootProfile || std::strcmp(hostRebootProfile, "1") != 0 ||
+        transfer.kind != ps2x::iop::SifTransferKind::SetDma ||
+        transfer.phase != ps2x::iop::SifTransferPhase::AfterCopy ||
+        getIoPaths().elfPath.filename() != "SLUS_214.10" ||
+        transfer.size < 24u + 39u || !m_iopSubsystem)
+    {
+        return;
+    }
+
+    std::array<uint8_t, 104u> resetPacket{};
+    if (transfer.size != resetPacket.size() ||
+        !m_iopSubsystem->readMemory(transfer.destinationAddress, resetPacket.data(), resetPacket.size()))
+    {
+        return;
+    }
+
+    const auto readLe32 = [&resetPacket](size_t offset) -> uint32_t
+    {
+        return static_cast<uint32_t>(resetPacket[offset]) |
+               (static_cast<uint32_t>(resetPacket[offset + 1u]) << 8u) |
+               (static_cast<uint32_t>(resetPacket[offset + 2u]) << 16u) |
+               (static_cast<uint32_t>(resetPacket[offset + 3u]) << 24u);
+    };
+    constexpr uint32_t kSifCmdReset = 0x80000003u;
+    constexpr uint32_t kResetArgumentBytes = 39u;
+    if (readLe32(0u) != resetPacket.size() || readLe32(4u) != 0u ||
+        readLe32(8u) != kSifCmdReset || readLe32(16u) != kResetArgumentBytes ||
+        readLe32(20u) != 0u)
+    {
+        return;
+    }
+
+    const std::string resetArguments(
+        reinterpret_cast<const char *>(resetPacket.data() + 24u), kResetArgumentBytes);
+    constexpr std::string_view kUdnlPrefix = "rom0:UDNL ";
+    if (!resetArguments.starts_with(kUdnlPrefix))
+        return;
+
+    bool expected = false;
+    if (!g_armageddonHostRebootAttempted.compare_exchange_strong(expected, true))
+        return;
+
+    const std::string imagePath = resetArguments.substr(kUdnlPrefix.size());
+    const uint32_t resetTransferSize = transfer.size;
+    const uint32_t resetTransferDestination = transfer.destinationAddress;
+    auto hostReboot = [this, resetArguments, imagePath, resetTransferSize, resetTransferDestination, kSifCmdReset]()
+    {
+    std::cout << "[Armageddon host reboot] profile=host-reboot-shortcut"
+              << " trigger=observed_guest_reset_packet"
+              << " command=0x" << std::hex << kSifCmdReset
+              << " bytes=0x" << resetTransferSize
+              << " iop_destination=0x" << resetTransferDestination << std::dec
+              << " args='" << resetArguments << "'"
+              << " image='" << imagePath << "'"
+              << " order_source=local_ROM0_IOPBTCONF_intersection"
+              << " guest_udnl_executed=false" << std::endl;
+
+    m_iopSubsystem->reset();
+
+    // DNAS310.IMG has no IOPBTCONF. This order is the intersection of its
+    // validated ROMDIR inventory with the selected local ROM0 IOPBTCONF, not
+    // the DNAS ROMDIR order and not a claim about a different retail BIOS.
+    static constexpr std::array<std::string_view, 16u> kDnasBootOrder{{
+        "SYSMEM", "LOADCORE", "TIMEMANI", "SYSCLIB", "THREADMAN", "IOMAN",
+        "MODLOAD", "ROMDRV", "STDIO", "SIFMAN", "SIFCMD", "LOADFILE",
+        "CDVDMAN", "CDVDFSV", "FILEIO", "EESYNC",
+    }};
+    constexpr uint64_t kMaxEeCyclesPerModule = 1'000'000u;
+    constexpr uint64_t kEeCycleStep = 4096u;
+    bool bootSucceeded = true;
+    for (const std::string_view moduleName : kDnasBootOrder)
+    {
+        if (moduleName == "LOADCORE")
+        {
+            // The DNAS LOADCORE IRX was observed to start a thread that remains
+            // blocked in this virtual-IOP implementation. IopEmulator already
+            // provides the LOADCORE import table and kernel lifecycle model;
+            // this shortcut uses that host implementation instead of claiming
+            // the original IRX completed.
+            const auto hostLoad = m_iopSubsystem->loadModuleScheduled("rom0:LOADCORE");
+            if (!hostLoad.handled || hostLoad.moduleId <= 0 || hostLoad.startResult != 0)
+            {
+                std::cerr << "[Armageddon host reboot] module=LOADCORE"
+                          << " host_implementation_load_failed=true id=" << hostLoad.moduleId
+                          << " result=" << hostLoad.startResult << std::endl;
+                bootSucceeded = false;
+                break;
+            }
+            std::cout << "[Armageddon host reboot] module=LOADCORE"
+                      << " source=IopLoadcore host_implementation=true"
+                      << " dnas_module_start=skipped reason=original_start_remained_pending"
+                      << " registered_id=" << hostLoad.moduleId << std::endl;
+            continue;
+        }
+
+        ps2x::iop::ModuleLoadResult load{};
+        std::string_view moduleSource = "DNAS310.IMG";
+        if (moduleName == "CDVDMAN")
+        {
+            // DNAS CDVDMAN's module_start remained pending, and its companion
+            // CDVDFSV imports sceGetFsvRbuf (ordinal 47). Use the matching
+            // selected BIOS CDVDMAN IRX to provide that real guest export;
+            // IopCdvd continues to handle the physical CD/DVD device and DMA.
+            const char *const rom0Path = std::getenv("PS2X_ARMAGEDDON_ROM0");
+            if (!rom0Path || rom0Path[0] == '\0')
+            {
+                std::cerr << "[Armageddon host reboot] module=CDVDMAN"
+                          << " source=selected_ROM0 unavailable=true" << std::endl;
+                bootSucceeded = false;
+                break;
+            }
+            moduleSource = "selected_ROM0";
+            load = m_iopSubsystem->loadRomDirModuleScheduled(rom0Path, moduleName, nullptr, 0u);
+        }
+        else
+        {
+            load = m_iopSubsystem->loadRomDirModuleScheduled(imagePath, moduleName, nullptr, 0u);
+        }
+        if (!load.handled || load.moduleId <= 0 || !load.startPending)
+        {
+            std::cerr << "[Armageddon host reboot] module=" << moduleName
+                      << " load_failed=true id=" << load.moduleId
+                      << " start_pending=" << load.startPending << std::endl;
+            bootSucceeded = false;
+            break;
+        }
+
+        uint64_t advanced = 0u;
+        ps2x::iop::IopModuleStartState state{};
+        while (advanced < kMaxEeCyclesPerModule)
+        {
+            state = m_iopSubsystem->moduleStartState(load.moduleId);
+            if (!state.found || !state.pending)
+                break;
+            m_iopSubsystem->runEeCycles(kEeCycleStep);
+            advanced += kEeCycleStep;
+        }
+        if (!state.found || state.pending || !state.returned ||
+            (state.startResult != 0 && state.startResult != 2))
+        {
+            std::array<uint32_t, 4u> pendingWords{};
+            const bool havePendingWords = state.pending && state.currentPc != 0u &&
+                                          m_iopSubsystem->readMemory(
+                                              state.currentPc, pendingWords.data(), sizeof(pendingWords));
+            std::cerr << "[Armageddon host reboot] module=" << moduleName
+                      << " start_failed=true found=" << state.found
+                      << " pending=" << state.pending
+                      << " returned=" << state.returned
+                      << " result=" << state.startResult
+                      << " pc=0x" << std::hex << state.stopPc << std::dec
+                      << " instructions=" << state.instructions
+                      << " thread_id=" << state.threadId
+                      << " thread_state=" << state.threadState
+                      << " current_pc=0x" << std::hex << state.currentPc
+                      << " wait_id=0x" << state.waitId
+                      << " wait_bits=0x" << state.waitBits
+                      << " a0=0x" << state.a0 << " a1=0x" << state.a1
+                      << " ra=0x" << state.ra
+                      << " current_words=";
+            if (havePendingWords)
+            {
+                for (const uint32_t word : pendingWords)
+                    std::cerr << "0x" << word << ',';
+            }
+            else
+            {
+                std::cerr << "unavailable";
+            }
+            std::cerr << std::dec << std::endl;
+            bootSucceeded = false;
+            break;
+        }
+        std::cout << "[Armageddon host reboot] module=" << moduleName
+                  << " source=" << moduleSource << " module_start_returned=true"
+                  << " result=" << state.startResult
+                  << " instructions=" << state.instructions << std::endl;
+
+        if (moduleName == "SIFMAN")
+        {
+            // This profile supplies the EE-side SIFINIT event after the
+            // original DNAS SIFMAN module starts, then invokes SIFMAN's own
+            // export to publish SMFLAG.SIFINIT. This is an explicit reboot
+            // shortcut assumption; it is not attributed to a captured EE PC.
+            constexpr uint32_t kMsflag = 3u;
+            constexpr uint32_t kSifInit = 0x00010000u;
+            if (!m_iopSubsystem->writeSifRegisterFromEe(kMsflag, kSifInit))
+            {
+                std::cerr << "[Armageddon host reboot] SIFINIT failed:"
+                          << " host_EE_MSFLAG_write_rejected=true" << std::endl;
+                bootSucceeded = false;
+                break;
+            }
+            std::cout << "[Armageddon host reboot] event=EE_MSFLAG_SIFINIT"
+                      << " value=0x10000 source=host_reboot_assumption"
+                      << " writer_pc=unattributed" << std::endl;
+
+            const auto sifInit = m_iopSubsystem->scheduleExportCall("sifman", 5u);
+            if (!sifInit.found || sifInit.id == 0u)
+            {
+                std::cerr << "[Armageddon host reboot] SIFINIT failed:"
+                          << " DNAS_sifman_export_5_unavailable=true" << std::endl;
+                bootSucceeded = false;
+                break;
+            }
+            uint64_t callAdvanced = 0u;
+            ps2x::iop::IopScheduledCallState callState{};
+            while (callAdvanced < kMaxEeCyclesPerModule)
+            {
+                callState = m_iopSubsystem->scheduledCallState(sifInit.id);
+                if (!callState.found || callState.finished)
+                    break;
+                m_iopSubsystem->runEeCycles(kEeCycleStep);
+                callAdvanced += kEeCycleStep;
+            }
+            const bool released = m_iopSubsystem->releaseScheduledCall(sifInit.id);
+            uint32_t smflagAfterSifInit = 0u;
+            if (!callState.found || !callState.finished || !callState.returned ||
+                !released || callState.value != 1u ||
+                !m_iopSubsystem->readSifRegister(4u, smflagAfterSifInit) ||
+                (smflagAfterSifInit & kSifInit) == 0u)
+            {
+                std::cerr << "[Armageddon host reboot] SIFINIT failed:"
+                          << " finished=" << callState.finished
+                          << " returned=" << callState.returned
+                          << " result=0x" << std::hex << callState.value
+                          << " SMFLAG=0x" << smflagAfterSifInit << std::dec << std::endl;
+                bootSucceeded = false;
+                break;
+            }
+            std::cout << "[Armageddon host reboot] event=IOP_SMFLAG_SIFINIT"
+                      << " source=original_DNAS_SIFMAN_export_5"
+                      << " returned=true value=1 smflag=0x" << std::hex
+                      << smflagAfterSifInit << std::dec << std::endl;
+        }
+    }
+
+    if (!bootSucceeded)
+    {
+        std::cerr << "[Armageddon host reboot] bootend_published=false"
+                  << " reason=module_load_or_start_failure" << std::endl;
+        return;
+    }
+
+    // Start the original DNAS SIFCMD sceSifInitRpc export after its IRX and
+    // dependent modules have started. It publishes CMDINIT and then remains
+    // pending for the EE's INIT_CMD; this reproduces the guest command path
+    // instead of setting CMDINIT from the host.
+    const auto initRpcCall = m_iopSubsystem->scheduleExportCall("sifcmd", 14u, 0u, 0u, 0u, 0u);
+    if (!initRpcCall.found || initRpcCall.id == 0u)
+    {
+        std::cerr << "[Armageddon host reboot] CMDINIT failed"
+                  << " original_DNAS_sifcmd_export_14_unavailable=true" << std::endl;
+        return;
+    }
+    constexpr uint32_t kCmdInit = 0x00020000u;
+    uint64_t initRpcAdvanced = 0u;
+    bool cmdInitPublished = false;
+    ps2x::iop::IopScheduledCallState initRpcState{};
+    while (initRpcAdvanced < kMaxEeCyclesPerModule)
+    {
+        initRpcState = m_iopSubsystem->scheduledCallState(initRpcCall.id);
+        if (!initRpcState.found)
+        {
+            std::cerr << "[Armageddon host reboot] CMDINIT failed"
+                      << " scheduled_call_state_disappeared=true" << std::endl;
+            return;
+        }
+        if (initRpcState.finished)
+        {
+            if (initRpcState.returned)
+                (void)m_iopSubsystem->releaseScheduledCall(initRpcCall.id);
+            uint32_t finishedSmflag = 0u;
+            cmdInitPublished = initRpcState.returned &&
+                               m_iopSubsystem->readSifRegister(4u, finishedSmflag) &&
+                               (finishedSmflag & kCmdInit) != 0u;
+            break;
+        }
+        uint32_t currentSmflag = 0u;
+        if (!m_iopSubsystem->readSifRegister(4u, currentSmflag))
+        {
+            std::cerr << "[Armageddon host reboot] CMDINIT failed"
+                      << " SMFLAG_unavailable=true" << std::endl;
+            return;
+        }
+        if (initRpcState.instructions != 0u && (currentSmflag & kCmdInit) != 0u)
+        {
+            cmdInitPublished = true;
+            std::cout << "[Armageddon host reboot] event=IOP_SMFLAG_CMDINIT"
+                      << " source=original_DNAS_sifcmd_export_14"
+                      << " returned=false pending_guest_INIT_CMD=true"
+                      << " entry=0x" << std::hex << initRpcState.entry
+                      << " stop_pc=0x" << initRpcState.stopPc
+                      << " smflag=0x" << currentSmflag << std::dec << std::endl;
+            break;
+        }
+        m_iopSubsystem->runEeCycles(kEeCycleStep);
+        initRpcAdvanced += kEeCycleStep;
+    }
+    if (!cmdInitPublished)
+    {
+        uint32_t currentSmflag = 0u;
+        (void)m_iopSubsystem->readSifRegister(4u, currentSmflag);
+        std::cerr << "[Armageddon host reboot] CMDINIT failed"
+                  << " reached=false instructions=" << initRpcState.instructions
+                  << " SMFLAG=0x" << std::hex << currentSmflag << std::dec << std::endl;
+        return;
+    }
+
+    constexpr uint32_t kSmflag = 4u;
+    constexpr uint32_t kBootEnd = 0x00040000u;
+    uint32_t smflagBefore = 0u;
+    if (!m_iopSubsystem->readSifRegister(kSmflag, smflagBefore) ||
+        !m_iopSubsystem->writeSifRegisterFromIop(kSmflag, kBootEnd))
+    {
+        std::cerr << "[Armageddon host reboot] bootend_published=false"
+                  << " reason=IOP_SMFLAG_unavailable" << std::endl;
+        return;
+    }
+    uint32_t smflagAfter = 0u;
+    const bool readBack = m_iopSubsystem->readSifRegister(kSmflag, smflagAfter);
+    std::cout << "[Armageddon host reboot] bootend_published=true"
+              << " publisher=host_shortcut"
+              << " guest_EESYNC_claim=false"
+              << " original_sifcmd_cmdinit=true"
+              << " smflag_before=0x" << std::hex << smflagBefore
+              << " smflag_after=0x" << smflagAfter << std::dec
+              << " readback=" << readBack
+              << " iop_initialization_verified=false" << std::endl;
+
+    };
+    {
+        std::lock_guard<std::mutex> lock(g_armageddonHostRebootMutex);
+        g_pendingArmageddonHostRebootOwner = this;
+        g_pendingArmageddonHostReboot = std::move(hostReboot);
+    }
+    std::cout << "[Armageddon host reboot] reset_request_queued=true"
+              << " trigger=observed_guest_reset_packet"
+              << " defer_until_guest_ack=SMFLAG_CMDINIT" << std::endl;
 }
 
 void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
@@ -648,6 +1075,253 @@ bool PS2Runtime::zeroIopMemory(uint32_t address, size_t size)
 bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
 {
     return m_iopSubsystem && m_iopSubsystem->isMemoryRange(address, size);
+}
+
+bool PS2Runtime::readIopSifRegister(uint32_t index, uint32_t &value) const
+{
+    return m_iopSubsystem && m_iopSubsystem->readSifRegister(index, value);
+}
+
+bool PS2Runtime::writeIopSifRegisterFromEe(uint32_t index, uint32_t value)
+{
+    return m_iopSubsystem && m_iopSubsystem->writeSifRegisterFromEe(index, value);
+}
+
+bool PS2Runtime::bootstrapArmageddonIopFromRom0(const std::filesystem::path &rom0Path)
+{
+    constexpr uint32_t kEeToIopMsflag = 3u;
+    constexpr uint32_t kIopToEeSmflag = 4u;
+    constexpr uint32_t kSifInit = 0x00010000u;
+    constexpr uint32_t kCmdInit = 0x00020000u;
+    constexpr uint64_t kMaxEeCyclesPerOperation = 1'000'000u;
+    constexpr uint64_t kEeCycleStep = 4096u;
+
+    const auto fail = [](const std::string &message)
+    {
+        std::cerr << "[Armageddon IOP bootstrap] failed: " << message << std::endl;
+        return false;
+    };
+
+    std::ifstream bios(rom0Path, std::ios::binary | std::ios::ate);
+    if (!bios)
+        return fail("could not open the selected ROM0 image for the IOP BIOS window");
+    const std::streamoff biosSize = bios.tellg();
+    constexpr std::streamoff kRom0Bytes = 4 * 1024 * 1024;
+    if (biosSize != kRom0Bytes)
+        return fail("selected ROM0 image is not exactly 4 MB; refusing a partial IOP ROM map");
+    std::vector<uint8_t> biosBytes(static_cast<size_t>(biosSize));
+    bios.seekg(0, std::ios::beg);
+    if (!bios.read(reinterpret_cast<char *>(biosBytes.data()), biosSize) ||
+        !m_iopSubsystem->setRom0Image(biosBytes))
+        return fail("could not map selected ROM0 bytes into IOP address 0xBFC00000");
+    std::cout << "[Armageddon IOP bootstrap] iop_rom0_mapped=true"
+              << " source=selected_user_BIOS_ROM0 address=0xbfc00000"
+              << " bytes=0x" << std::hex << biosBytes.size() << std::dec << std::endl;
+
+    uint32_t msflag = 0u;
+    uint32_t smflag = 0u;
+    if (!readIopSifRegister(kEeToIopMsflag, msflag) ||
+        !readIopSifRegister(kIopToEeSmflag, smflag))
+    {
+        return fail("SIF registers unavailable after IOP reset");
+    }
+    if (msflag != 0u || smflag != 0u)
+    {
+        return fail("expected cleared SIF registers after IOP reset; refusing to hide prior state");
+    }
+
+    const auto runModuleStart = [&](std::string_view moduleName) -> bool
+    {
+        const auto load = loadIopRomDirModuleScheduled(rom0Path.string(), moduleName, nullptr, 0u);
+        if (!load.handled || load.moduleId <= 0 || !load.startPending)
+        {
+            std::cerr << "[Armageddon IOP bootstrap] ROM0 module load rejected: " << moduleName
+                      << " handled=" << load.handled << " id=" << load.moduleId
+                      << " start=" << load.startResult << " pending=" << load.startPending << std::endl;
+            return false;
+        }
+
+        uint64_t advanced = 0u;
+        while (advanced < kMaxEeCyclesPerOperation)
+        {
+            const auto state = iopModuleStartState(load.moduleId);
+            if (!state.found)
+            {
+                std::cerr << "[Armageddon IOP bootstrap] module state disappeared: " << moduleName << std::endl;
+                return false;
+            }
+            if (!state.pending)
+            {
+                std::cout << "[Armageddon IOP bootstrap] module=" << moduleName
+                          << " entry=0x" << std::hex << state.entry
+                          << " stop_pc=0x" << state.stopPc << std::dec
+                          << " instructions=" << state.instructions
+                          << " returned=" << state.returned
+                          << " start_result=" << state.startResult << std::endl;
+                return state.returned && (state.startResult == 0 || state.startResult == 2);
+            }
+            advanceIopEeCycles(kEeCycleStep);
+            advanced += kEeCycleStep;
+        }
+
+        const auto state = iopModuleStartState(load.moduleId);
+        std::cerr << "[Armageddon IOP bootstrap] bounded module_start stop: module=" << moduleName
+                  << " pc=0x" << std::hex << state.stopPc << std::dec
+                  << " instructions=" << state.instructions << std::endl;
+        return false;
+    };
+
+    const auto runExport = [&](std::string_view library, uint16_t ordinal) -> bool
+    {
+        const auto call = scheduleIopExportCall(library, ordinal, 0u, 0u, 0u, 0u);
+        if (!call.found || call.id == 0u)
+        {
+            std::cerr << "[Armageddon IOP bootstrap] original IOP export unavailable: "
+                      << library << ':' << ordinal << std::endl;
+            return false;
+        }
+
+        uint64_t advanced = 0u;
+        while (advanced < kMaxEeCyclesPerOperation)
+        {
+            const auto state = iopScheduledCallState(call.id);
+            if (!state.found)
+            {
+                (void)releaseIopScheduledCall(call.id);
+                std::cerr << "[Armageddon IOP bootstrap] scheduled export state disappeared: "
+                          << library << ':' << ordinal << std::endl;
+                return false;
+            }
+            if (state.finished)
+            {
+                std::cout << "[Armageddon IOP bootstrap] export=" << library << ':' << ordinal
+                          << " entry=0x" << std::hex << state.entry
+                          << " stop_pc=0x" << state.stopPc << std::dec
+                          << " instructions=" << state.instructions
+                          << " returned=" << state.returned
+                          << " raw_v0=0x" << std::hex << state.value << std::dec << std::endl;
+                const bool released = releaseIopScheduledCall(call.id);
+                return state.returned && released;
+            }
+            advanceIopEeCycles(kEeCycleStep);
+            advanced += kEeCycleStep;
+        }
+
+        const auto state = iopScheduledCallState(call.id);
+        (void)releaseIopScheduledCall(call.id);
+        std::cerr << "[Armageddon IOP bootstrap] bounded export stop: " << library << ':' << ordinal
+                  << " pc=0x" << std::hex << state.stopPc << std::dec
+                  << " instructions=" << state.instructions << std::endl;
+        return false;
+    };
+
+    std::cout << "[Armageddon IOP bootstrap] profile=rom0-sifman-sifcmd-cdvdman-cdvdfsv-fileio"
+              << " image='" << rom0Path.string() << "'"
+              << " entry_hle=EE MSFLAG.SIFINIT"
+              << " reference_assumption=true writer_pc=unattributed" << std::endl;
+
+    // SIFMAN and SIFCMD execute as original ROM0 IRXs. The only host-side
+    // operation here is the documented EE-to-IOP MSFLAG SIFINIT event that
+    // analogous to the reference entry state. The retained PCSX2 capture does
+    // not attribute its writer PC, so this is an explicit HLE assumption, not
+    // a claim that we reproduced the historical BIOS instruction sequence.
+    // The resulting SMFLAG bits must still be published by the guest IOP code.
+    if (!runModuleStart("SIFMAN"))
+        return fail("SIFMAN module_start did not return successfully");
+    if (!writeIopSifRegisterFromEe(kEeToIopMsflag, kSifInit))
+        return fail("EE-side SIFINIT register operation failed");
+    if (!runExport("sifman", 5u))
+        return fail("original SIFMAN sceSifInit did not return");
+    if (!readIopSifRegister(kIopToEeSmflag, smflag) || (smflag & kSifInit) == 0u)
+        return fail("original SIFMAN code did not publish IOP-to-EE SIFINIT");
+
+    if (!runModuleStart("SIFCMD"))
+        return fail("SIFCMD module_start did not return successfully");
+    // The game's next startup phase binds RPC SID 0x80000592. The retail
+    // CDVDFSV image registers this service after CDVDMAN has initialized;
+    // loading only FILEIO leaves the guest's bind loop polling a server that
+    // the native IOP has never started. Keep both providers as their original
+    // ROM0 IRXs so `canBindRpc` becomes true only after their guest
+    // registration code actually runs.
+    if (!runModuleStart("CDVDMAN"))
+        return fail("CDVDMAN module_start did not return successfully");
+    if (!runModuleStart("CDVDFSV"))
+        return fail("CDVDFSV module_start did not return successfully");
+    // Armageddon binds RPC SID 0x80000003 before its later IOP reset. The
+    // retained native transfer shows the bind reply has a null server pointer
+    // until the BIOS FILEIO service is running. FILEIO is the original ROM0
+    // provider for the IOP heap/file I/O RPC servers. Its module_start returns
+    // after creating its worker; that worker waits for the guest SIFCMD init
+    // event and then registers the server through the original IOP code.
+    if (!runModuleStart("FILEIO"))
+        return fail("original ROM0 FILEIO module_start did not return successfully");
+    // sceSifInitRpc is the original IOP producer for SREG[0]=1. It invokes
+    // sceSifInitCmd itself, publishes CMDINIT, waits for the first EE INIT_CMD,
+    // sends SET_SREG(0, 1) through the guest SIFMAN path, then waits for the
+    // second INIT_CMD. Scheduling the export preserves that original blocking
+    // sequence while allowing the EE to make progress between the waits.
+    const auto initRpcCall = scheduleIopExportCall("sifcmd", 14u, 0u, 0u, 0u, 0u);
+    if (!initRpcCall.found || initRpcCall.id == 0u)
+        return fail("original SIFCMD sceSifInitRpc export is unavailable");
+
+    bool reachedCmdInitWait = false;
+    uint64_t advanced = 0u;
+    while (advanced < kMaxEeCyclesPerOperation)
+    {
+        const auto state = iopScheduledCallState(initRpcCall.id);
+        if (!state.found)
+            return fail("scheduled SIFCMD sceSifInitRpc state disappeared");
+        if (state.finished)
+        {
+            if (!state.returned || !releaseIopScheduledCall(initRpcCall.id))
+                return fail("original SIFCMD sceSifInitRpc returned with an error");
+            reachedCmdInitWait = true;
+            std::cout << "[Armageddon IOP bootstrap] export=sifcmd:14 returned before EE startup"
+                      << " entry=0x" << std::hex << state.entry
+                      << " stop_pc=0x" << state.stopPc << std::dec
+                      << " instructions=" << state.instructions << std::endl;
+            break;
+        }
+
+        uint32_t currentSmflag = 0u;
+        if (!readIopSifRegister(kIopToEeSmflag, currentSmflag))
+            return fail("could not read SMFLAG while starting original SIFCMD code");
+        if (state.instructions != 0u && (currentSmflag & kCmdInit) != 0u)
+        {
+            reachedCmdInitWait = true;
+            std::cout << "[Armageddon IOP bootstrap] export=sifcmd:14 scheduled"
+                      << " entry=0x" << std::hex << state.entry
+                      << " stop_pc=0x" << state.stopPc << std::dec
+                      << " instructions=" << state.instructions
+                      << " returned=false pending_guest_sif_command=true"
+                      << " reason=original IOP thread is waiting for EE INIT_CMD" << std::endl;
+            break;
+        }
+        advanceIopEeCycles(kEeCycleStep);
+        advanced += kEeCycleStep;
+    }
+    if (!reachedCmdInitWait)
+        return fail("original SIFCMD sceSifInitRpc did not reach CMDINIT publication within the startup budget");
+
+    if (!readIopSifRegister(kEeToIopMsflag, msflag) ||
+        !readIopSifRegister(kIopToEeSmflag, smflag) ||
+        (msflag & kSifInit) == 0u || (smflag & (kSifInit | kCmdInit)) != (kSifInit | kCmdInit))
+    {
+        return fail("final SIF registers do not match initialized modules (expected MSFLAG SIFINIT and SMFLAG SIFINIT|CMDINIT)");
+    }
+
+    std::cout << "[Armageddon IOP bootstrap] startup_prepared=true"
+              << " complete=false"
+              << " entry_state_seeded=false"
+              << " ee_host_sifinit=true"
+              << " reference_assumption=true"
+              << " original_sifman=true"
+              << " original_sifcmd=true"
+              << " original_fileio=true"
+              << " iop_sifcmd_initrpc_pending=" << (iopScheduledCallState(initRpcCall.id).found ? "true" : "false")
+              << " msflag=0x" << std::hex << msflag
+              << " smflag=0x" << smflag << std::dec << std::endl;
+    return true;
 }
 
 bool PS2Runtime::syncCoreSubsystems()
@@ -1065,6 +1739,15 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
         paths.mcRoot = paths.elfDirectory / "mc0";
     }
 
+    // A caller may supply the original disc image separately from the ELF.
+    // This keeps the extracted-directory virtual ISO as the default while
+    // allowing the IOP CDVD device to read the retail image's real sectors.
+    if (const char *cdImageOverride = std::getenv("PS2X_CD_IMAGE");
+        cdImageOverride != nullptr && cdImageOverride[0] != '\0')
+    {
+        paths.cdImage = std::filesystem::path(cdImageOverride);
+    }
+
     setIoPaths(paths);
 }
 
@@ -1076,6 +1759,14 @@ namespace
         {
             return false;
         }
+
+#if !defined(PS2X_ARMAGEDDON_RELOCATIONS)
+        if ((address >= 0x80076000u && address < 0x80076740u) ||
+            (address >= 0x00076000u && address < 0x00076740u))
+        {
+            address = 0x00599020u + (address & 0x7ffu);
+        }
+#endif
 
         if (address < g_ps2RecompiledFunctionTableBase || address >= g_ps2RecompiledFunctionTableEnd)
         {
@@ -1090,6 +1781,9 @@ namespace
 
 bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
 {
+#if defined(PS2X_ARMAGEDDON_RELOCATIONS)
+    address = armageddon_relocations::canonical(this, address);
+#endif
     uint32_t slot = 0u;
     if (!generatedFunctionTableSlot(address, slot))
     {
@@ -1111,6 +1805,9 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
 
 bool PS2Runtime::hasFunction(uint32_t address) const
 {
+#if defined(PS2X_ARMAGEDDON_RELOCATIONS)
+    address = armageddon_relocations::canonical(this, address);
+#endif
     uint32_t slot = 0u;
     return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
 }
@@ -1136,6 +1833,9 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
 
 PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
+#if defined(PS2X_ARMAGEDDON_RELOCATIONS)
+    address = armageddon_relocations::canonical(this, address);
+#endif
     pushDispatchPc(address);
 
     uint32_t slot = 0u;
@@ -1191,6 +1891,16 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
                                        GuestBranchKind kind,
                                        const char *debugName)
 {
+    if (m_diagnosticActive && m_diagnosticOutcome.stopReason == "running")
+    {
+        diagnosticCapture(ctx);
+        m_diagnosticOutcome.context.pc = targetPc;
+        m_diagnosticOutcome.stopReason = "missing_function";
+        m_diagnosticOutcome.missingSource = sourcePc;
+        m_diagnosticOutcome.missingTarget = targetPc;
+        m_diagnosticOutcome.missingTargetValid = true;
+        requestStop();
+    }
     const MissingFunctionPolicy policy = missingFunctionPolicy();
     const bool firstReport = !m_missingFunctionReported.exchange(true, std::memory_order_acq_rel);
 
@@ -1350,19 +2060,146 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      GuestBranchKind kind,
                                      const char *debugName)
 {
+#if defined(PS2X_ARMAGEDDON_RELOCATIONS)
+    const uint32_t callerExecPc = armageddon_relocations::executionPc(ctx);
+#endif
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+    const bool traceSifCallbackDispatch =
+        std::getenv("PS2X_SIF_TRACE_DATA") != nullptr && targetPc == 0x0010F5C8u;
+    static uint64_t sifSetSregDispatchCount = 0u;
+    if (traceSifCallbackDispatch)
+    {
+        ++sifSetSregDispatchCount;
+        std::cerr << "[EE_SIF_CALLBACK_DISPATCH] source=0x" << std::hex << sourcePc
+                  << " target=0x" << targetPc
+                  << " count=" << std::dec << sifSetSregDispatchCount << std::hex
+                  << " registered=" << (hasFunction(targetPc) ? "true" : "false")
+                  << " a0=0x" << GPR_U32(ctx, 4)
+                  << " a1=0x" << GPR_U32(ctx, 5)
+                  << " gp=0x" << GPR_U32(ctx, 28) << std::dec << std::endl;
+    }
+
+    // The game's SIF command dispatcher reaches its registered command
+    // callbacks through this indirect-call site. Trace every target there so
+    // command 8/9 delivery can be distinguished from the SET_SREG callback.
+    const bool traceSifCommandDispatch =
+        std::getenv("PS2X_SIF_TRACE_DATA") != nullptr && sourcePc == 0x0010FE48u && isCall;
+    static uint32_t sifCommandDispatchCount = 0u;
+    const bool traceSifCommand = traceSifCommandDispatch && sifCommandDispatchCount < 128u;
+    if (traceSifCommand)
+    {
+        ++sifCommandDispatchCount;
+        uint32_t initStatus = 0u;
+        if (rdram != nullptr)
+            std::memcpy(&initStatus, rdram + 0x006536E4u, sizeof(initStatus));
+        std::cerr << "[EE_SIF_COMMAND_CALLBACK_ENTRY] count=" << std::dec << sifCommandDispatchCount
+                  << " source=0x" << std::hex << sourcePc << " target=0x" << targetPc
+                  << " registered=" << (hasFunction(targetPc) ? "true" : "false")
+                  << " kind=" << std::dec << static_cast<unsigned>(kind)
+                  << " a0=0x" << std::hex << GPR_U32(ctx, 4)
+                  << " a1=0x" << GPR_U32(ctx, 5) << " a2=0x" << GPR_U32(ctx, 6)
+                  << " a3=0x" << GPR_U32(ctx, 7) << " gp=0x" << GPR_U32(ctx, 28)
+                  << " status_0x6536e4=0x" << initStatus << std::dec << std::endl;
+    }
+
+    const bool traceSifNestedCallback =
+        std::getenv("PS2X_SIF_TRACE_DATA") != nullptr && sourcePc == 0x00110294u && isCall;
+    static uint32_t sifNestedCallbackCount = 0u;
+    const bool traceSifNested = traceSifNestedCallback && sifNestedCallbackCount < 128u;
+    if (traceSifNested)
+    {
+        ++sifNestedCallbackCount;
+        std::cerr << "[EE_SIF_NESTED_CALLBACK_ENTRY] count=" << std::dec << sifNestedCallbackCount
+                  << " source=0x" << std::hex << sourcePc << " target=0x" << targetPc
+                  << " registered=" << (hasFunction(targetPc) ? "true" : "false")
+                  << " a0=0x" << GPR_U32(ctx, 4) << " a1=0x" << GPR_U32(ctx, 5)
+                  << " a2=0x" << GPR_U32(ctx, 6) << " a3=0x" << GPR_U32(ctx, 7)
+                  << " gp=0x" << GPR_U32(ctx, 28) << std::dec << std::endl;
+    }
+
+    const bool bootTraceRequested = std::getenv("PS2X_EE_BOOT_TRACE") != nullptr;
+    const bool traceBootCallTarget = targetPc == 0x00122740u || targetPc == 0x00221C90u ||
+                                     targetPc == 0x0010FF28u || targetPc == 0x001171B0u ||
+                                     targetPc == 0x001170D8u || targetPc == 0x001105C0u ||
+                                     targetPc == 0x00110600u || targetPc == 0x001106D0u ||
+                                     targetPc == 0x00110570u || targetPc == 0x0010FCF0u;
+    static uint32_t bootTraceCallCount = 0u;
+    const bool traceBootCall = bootTraceRequested && traceBootCallTarget && bootTraceCallCount < 64u;
+    if (traceBootCall)
+    {
+        ++bootTraceCallCount;
+        const GuestThread *owner = m_eeScheduler ? m_eeScheduler->currentThread() : nullptr;
+        uint32_t sifInitStatus = 0u;
+        if (rdram != nullptr)
+            std::memcpy(&sifInitStatus, rdram + 0x006536E4u, sizeof(sifInitStatus));
+        std::cerr << "[EE_BOOT_CALL_ENTRY] source=0x" << std::hex << sourcePc
+                  << " target=0x" << targetPc << " fallthrough=0x" << fallthroughPc
+                  << " kind=" << std::dec << static_cast<unsigned>(kind)
+                  << " name=" << (debugName ? debugName : "")
+                  << " thread=" << (owner ? owner->id : 0)
+                  << " ra=0x" << std::hex << GPR_U32(ctx, 31)
+                  << " a0=0x" << GPR_U32(ctx, 4) << " a1=0x" << GPR_U32(ctx, 5)
+                  << " a2=0x" << GPR_U32(ctx, 6) << " a3=0x" << GPR_U32(ctx, 7)
+                  << " gp=0x" << GPR_U32(ctx, 28)
+                  << " init_status_0x6536e4=0x" << sifInitStatus << std::dec << std::endl;
+    }
+
+    const bool startupFlowTraceRequested = std::getenv("PS2X_EE_STARTUP_FLOW_TRACE") != nullptr;
+    const bool startupFlowCallSite =
+        (sourcePc >= 0x00122740u && sourcePc < 0x00122AB8u) ||
+        (sourcePc >= 0x00294520u && sourcePc < 0x002947B8u);
+    static uint32_t startupFlowTraceCount = 0u;
+    const bool traceStartupFlow = startupFlowTraceRequested && startupFlowCallSite &&
+                                  startupFlowTraceCount < 1024u;
+    if (traceStartupFlow)
+    {
+        ++startupFlowTraceCount;
+        const GuestThread *owner = m_eeScheduler ? m_eeScheduler->currentThread() : nullptr;
+        std::cerr << "[EE_STARTUP_FLOW_CALL] source=0x" << std::hex << sourcePc
+                  << " target=0x" << targetPc << " fallthrough=0x" << fallthroughPc
+                  << " pc=0x" << ctx->pc << " ra=0x" << GPR_U32(ctx, 31)
+                  << " a0=0x" << GPR_U32(ctx, 4) << " a1=0x" << GPR_U32(ctx, 5)
+                  << " a2=0x" << GPR_U32(ctx, 6) << " a3=0x" << GPR_U32(ctx, 7)
+                  << " v0=0x" << GPR_U32(ctx, 2) << std::dec
+                  << " thread=" << (owner ? owner->id : 0) << std::endl;
+    }
 
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
     // this charge bounds straight-line call chains that have no local loop.
     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
     {
+        if (traceStartupFlow)
+        {
+            std::cerr << "[EE_STARTUP_FLOW_YIELD] reason=checkpoint_before_target source=0x"
+                      << std::hex << sourcePc << " target=0x" << targetPc
+                      << " pc=0x" << ctx->pc << std::dec << std::endl;
+        }
         return false;
     }
 
     if (!isCall)
     {
+        // Only the scheduler's active invocation may use its zero return sentinel.
+        // Null calls/jumps and main/foreign-context returns stay strict failures.
+        const GuestThread *owner = m_eeScheduler ? m_eeScheduler->currentThread() : nullptr;
+        if (std::getenv("PS2X_SIF_TRACE_DATA") != nullptr &&
+            kind == GuestBranchKind::Return && targetPc == 0u)
+        {
+            std::cerr << "[EE_ZERO_RETURN] source=0x" << std::hex << sourcePc
+                      << " caller_ra=0x" << GPR_U32(ctx, 31) << std::dec
+                      << " thread=" << (owner ? owner->id : 0)
+                      << " invocation_depth=" << (owner ? owner->invocations.size() : 0u)
+                      << " active_context=" << ((owner && ctx == &owner->activeContext()) ? "true" : "false")
+                      << std::endl;
+        }
+        if (kind == GuestBranchKind::Return && targetPc == 0u && owner &&
+            !owner->invocations.empty() && ctx == &owner->activeContext())
+        {
+            return false;
+        }
+
         if (!hasFunction(targetPc))
         {
             reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
@@ -1394,9 +2231,91 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
+#if defined(PS2X_ARMAGEDDON_RELOCATIONS)
+    const uint32_t canonicalTarget = armageddon_relocations::canonical(this, targetPc);
+    const uint32_t guestReturn = armageddon_relocations::guestAlias(fallthroughPc, callerExecPc);
+    if (guestReturn != fallthroughPc)
+    {
+        SET_GPR_U32(ctx, 31, guestReturn);
+    }
+    armageddon_relocations::Scope calleeScope(ctx, targetPc);
+    ctx->pc = canonicalTarget;
+    RecompiledFunction targetFn = lookupFunction(canonicalTarget);
+#else
     RecompiledFunction targetFn = lookupFunction(targetPc);
+#endif
     const uint32_t entryPc = ctx->pc;
+    diagnosticGuestDispatch(ctx);
     targetFn(rdram, ctx, this);
+
+    if (traceStartupFlow)
+    {
+        const GuestThread *owner = m_eeScheduler ? m_eeScheduler->currentThread() : nullptr;
+        std::cerr << "[EE_STARTUP_FLOW_RETURN] source=0x" << std::hex << sourcePc
+                  << " target=0x" << targetPc << " next_pc=0x" << ctx->pc
+                  << " ra=0x" << GPR_U32(ctx, 31) << " v0=0x" << GPR_U32(ctx, 2)
+                  << " sp=0x" << GPR_U32(ctx, 29) << std::dec
+                  << " inline=" << (ctx->pc == fallthroughPc ? "true" : "false")
+                  << " thread=" << (owner ? owner->id : 0) << std::endl;
+    }
+
+    if (traceBootCall)
+    {
+        const GuestThread *owner = m_eeScheduler ? m_eeScheduler->currentThread() : nullptr;
+        uint32_t sifInitStatus = 0u;
+        if (rdram != nullptr)
+            std::memcpy(&sifInitStatus, rdram + 0x006536E4u, sizeof(sifInitStatus));
+        std::cerr << "[EE_BOOT_CALL_RETURN] source=0x" << std::hex << sourcePc
+                  << " target=0x" << targetPc << " next_pc=0x" << ctx->pc
+                  << " ra=0x" << GPR_U32(ctx, 31) << " v0=0x" << GPR_U32(ctx, 2)
+                  << " sp=0x" << GPR_U32(ctx, 29)
+                  << " init_status_0x6536e4=0x" << sifInitStatus << std::dec
+                  << " thread=" << (owner ? owner->id : 0) << std::endl;
+    }
+
+    if (traceSifCallbackDispatch)
+    {
+        std::cerr << "[EE_SIF_CALLBACK_DISPATCH_RETURN] target=0x" << std::hex << targetPc
+                  << " next_pc=0x" << ctx->pc << std::dec << std::endl;
+        uint32_t sregsAddress = 0u;
+        uint32_t sreg0 = 0u;
+        bool sreg0Valid = false;
+        if (rdram != nullptr)
+        {
+            std::memcpy(&sregsAddress, rdram + 0x00650434u, sizeof(sregsAddress));
+            const uint32_t physical = sregsAddress & 0x1FFFFFFFu;
+            if (sregsAddress != 0u && physical <= PS2_RAM_SIZE - sizeof(sreg0))
+            {
+                std::memcpy(&sreg0, rdram + physical, sizeof(sreg0));
+                sreg0Valid = true;
+            }
+        }
+        std::cerr << "[EE_SIF_CALLBACK_RESULT] set_sreg_dispatches=" << sifSetSregDispatchCount
+                  << " sregs_ptr=0x" << std::hex << sregsAddress
+                  << " sreg0=" << (sreg0Valid ? "0x" : "<invalid>");
+        if (sreg0Valid)
+            std::cerr << std::hex << sreg0;
+        std::cerr << std::dec << std::endl;
+    }
+
+    if (traceSifCommand)
+    {
+        uint32_t initStatus = 0u;
+        if (rdram != nullptr)
+            std::memcpy(&initStatus, rdram + 0x006536E4u, sizeof(initStatus));
+        std::cerr << "[EE_SIF_COMMAND_CALLBACK_RETURN] count=" << std::dec << sifCommandDispatchCount
+                  << " target=0x" << std::hex << targetPc << " next_pc=0x" << ctx->pc
+                  << " v0=0x" << GPR_U32(ctx, 2) << " status_0x6536e4=0x" << initStatus
+                  << std::dec << std::endl;
+    }
+
+    if (traceSifNested)
+    {
+        std::cerr << "[EE_SIF_NESTED_CALLBACK_RETURN] count=" << std::dec << sifNestedCallbackCount
+                  << " target=0x" << std::hex << targetPc << " next_pc=0x" << ctx->pc
+                  << " v0=0x" << GPR_U32(ctx, 2) << " v1=0x" << GPR_U32(ctx, 3)
+                  << std::dec << std::endl;
+    }
 
     if (isStopRequested() || ctx->pc == 0u)
     {
@@ -2344,6 +3263,23 @@ void PS2Runtime::run()
     m_stopRequested.store(false, std::memory_order_relaxed);
     ps2_stubs::resetSifState();
     resetIop();
+    const std::string elfName = getIoPaths().elfPath.filename().string();
+    if (elfName == "SLUS_214.10" && m_cpuContext.pc == 0x00100008u)
+    {
+        const char *rom0Path = std::getenv("PS2X_ARMAGEDDON_ROM0");
+        if (rom0Path && rom0Path[0] != '\0')
+        {
+            if (!bootstrapArmageddonIopFromRom0(std::filesystem::path(rom0Path)))
+            {
+                requestStop();
+                return;
+            }
+        }
+        else
+        {
+            std::cerr << "[Armageddon IOP bootstrap] disabled: set PS2X_ARMAGEDDON_ROM0 to a matching user BIOS ROM0; unseeded baseline retained" << std::endl;
+        }
+    }
     ps2_stubs::resetAudioStubState();
     ps2_stubs::resetMpegStubState();
     initializeEeKernelState(m_memory.getRDRAM());
@@ -2470,3 +3406,5 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("[run] exiting loop");
 }
+
+#include "armageddon_diagnostic_runtime_extension.inc"

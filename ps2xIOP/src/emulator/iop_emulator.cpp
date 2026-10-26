@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <map>
 #include <optional>
 #include <span>
@@ -32,6 +33,19 @@ namespace ps2x::iop::detail
         constexpr uint32_t kRamSize = IopMemory::RamSize;
         constexpr uint32_t kKernelHeapBase = IopMemory::HeapBase;
         constexpr uint32_t kKernelHeapLimit = IopMemory::HeapLimit;
+        // PS2SDK intrman.h names IOP_IRQ_DMA_SIF1 as DMA IRQ 0x2B. EE-to-IOP
+        // SIF transfers complete on this channel. Delivery is deferred to the
+        // existing IOP cycle scheduler, after the host has copied the payload.
+        constexpr int kIopIrqDmaSif1 = 0x2B;
+        constexpr int kIopIrqDmaSif0 = 0x2A;
+        constexpr int kIopIrqCdvd = 0x02;
+        constexpr int kNoDmaInterrupt = -1;
+        constexpr uint32_t kIopSif0ChcrChainMode = 0x00000700u;
+        constexpr uint32_t kIopSif0TagChain = 0x10000000u;
+        constexpr uint32_t kIopSif0TagInterruptOutput = 0x80000000u;
+        constexpr uint32_t kIopSif0TagEnd = 0x80000000u;
+        constexpr uint32_t kIopSif0MaxTags = 32u;
+        constexpr uint32_t kIopSif0MaxBytes = 32u * 1024u * 1024u;
         constexpr uint32_t kCallStackBase = kKernelHeapLimit;
         constexpr uint32_t kCallStackLimit = 0x001FFF00u;
         constexpr uint32_t kCallStackSize = 0x2000u;
@@ -78,6 +92,13 @@ namespace ps2x::iop::detail
             uint32_t entry = 0;
             uint32_t gp = 0;
             bool resident = false;
+            bool startPending = false;
+            bool startReturned = false;
+            int32_t startResult = -1;
+            int startThreadId = 0;
+            uint32_t startArguments = 0;
+            uint32_t startStopPc = 0;
+            uint64_t startInstructions = 0;
         };
 
         struct GuestCallback
@@ -91,6 +112,26 @@ namespace ps2x::iop::detail
             uint32_t function = 0u;
             uint32_t gp = 0u;
             uint32_t argument = 0u;
+        };
+
+        struct PendingDma
+        {
+            int irq = kNoDmaInterrupt;
+            uint64_t completionCycle = 0u;
+            uint32_t channel = 0u;
+            uint32_t finalMadr = 0u;
+            uint32_t finalTadr = 0u;
+            bool sif0 = false;
+            bool interruptOutput = false;
+        };
+
+        struct Sif0Transfer
+        {
+            uint32_t source = 0u;
+            uint32_t destination = 0u;
+            uint32_t size = 0u;
+            bool interruptOutput = false;
+            std::vector<uint8_t> bytes;
         };
 
         explicit Impl(IopHost &hostRef)
@@ -126,6 +167,8 @@ namespace ps2x::iop::detail
             ioman.reset();
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
+            scheduledExportCalls.clear();
+            nextScheduledCallId = 1u;
             nextModuleId = 1;
             moduleCursor = kModuleLoadBase;
             totalCycles = 0;
@@ -176,8 +219,154 @@ namespace ps2x::iop::detail
 
         void schedulePendingDma()
         {
-            if (const auto dma = memory.takeDmaStart())
-                pendingDmaInterrupts[dma->irq] = totalCycles + dma->delayCycles;
+            const auto dma = memory.takeDmaStart();
+            if (!dma)
+                return;
+
+            if (dma->channel != 9u)
+            {
+                pendingDmaInterrupts[dma->irq] = PendingDma{
+                    dma->irq, totalCycles + dma->delayCycles, dma->channel, 0u, 0u, false, false};
+                return;
+            }
+
+            if ((dma->chcr & kIopSif0ChcrChainMode) != kIopSif0ChcrChainMode)
+            {
+                log(LogLevel::Error, "[IOP_SIF0_CHAIN_REJECTED] unsupported IOP SIF0 DMA mode");
+                return;
+            }
+
+            std::vector<Sif0Transfer> transfers;
+            transfers.reserve(kIopSif0MaxTags);
+            uint32_t tagAddress = dma->tadr;
+            uint32_t finalMadr = dma->madr;
+            uint32_t finalTadr = tagAddress;
+            uint32_t totalBytes = 0u;
+            bool chainEnded = false;
+            bool interruptOutput = false;
+
+            for (uint32_t i = 0u; i < kIopSif0MaxTags; ++i)
+            {
+                uint32_t tag[4]{};
+                if (tagAddress > IopMemory::RamSize - sizeof(tag) ||
+                    !memory.readRam(tagAddress, tag, sizeof(tag)))
+                {
+                    log(LogLevel::Error, "[IOP_SIF0_CHAIN_REJECTED] tag outside IOP RAM");
+                    return;
+                }
+                if ((tag[2] & kIopSif0TagChain) == 0u)
+                {
+                    log(LogLevel::Error, "[IOP_SIF0_CHAIN_REJECTED] unrecognized SIF tag format");
+                    return;
+                }
+
+                const uint32_t words = tag[1] & 0x00FFFFFFu;
+                const uint32_t qwords = tag[2] & 0x0000FFFFu;
+                const uint64_t usedBytes = static_cast<uint64_t>(words) * sizeof(uint32_t);
+                const uint64_t transferBytes = static_cast<uint64_t>(qwords) * 16u;
+                if (words == 0u || qwords == 0u || usedBytes > transferBytes ||
+                    transferBytes > kIopSif0MaxBytes || totalBytes > kIopSif0MaxBytes - transferBytes)
+                {
+                    log(LogLevel::Error, "[IOP_SIF0_CHAIN_REJECTED] invalid SIF tag size");
+                    return;
+                }
+
+                Sif0Transfer transfer{};
+                transfer.source = tag[0] & 0x00FFFFFFu;
+                transfer.destination = tag[3] & 0x1FFFFFFFu;
+                transfer.size = static_cast<uint32_t>(transferBytes);
+                transfer.interruptOutput = (tag[2] & kIopSif0TagInterruptOutput) != 0u;
+                transfer.bytes.resize(transfer.size);
+                if (!memory.readRam(transfer.source, transfer.bytes.data(), transfer.bytes.size()))
+                {
+                    log(LogLevel::Error, "[IOP_SIF0_CHAIN_REJECTED] source outside IOP RAM");
+                    return;
+                }
+                std::vector<uint8_t> destinationProbe(transfer.size);
+                if (!host.readGuest(transfer.destination, destinationProbe.data(), destinationProbe.size()))
+                {
+                    log(LogLevel::Error, "[IOP_SIF0_CHAIN_REJECTED] destination outside EE RAM");
+                    return;
+                }
+
+                totalBytes += transfer.size;
+                interruptOutput = interruptOutput || transfer.interruptOutput;
+                finalMadr = (transfer.source + transfer.size) & 0x00FFFFFFu;
+                finalTadr = tagAddress + sizeof(tag);
+                chainEnded = (tag[0] & kIopSif0TagEnd) != 0u;
+                transfers.push_back(std::move(transfer));
+                if (chainEnded)
+                    break;
+                tagAddress = finalTadr;
+            }
+
+            if (!chainEnded || transfers.empty())
+            {
+                log(LogLevel::Error, "[IOP_SIF0_CHAIN_REJECTED] unterminated or empty SIF chain");
+                return;
+            }
+
+            for (const Sif0Transfer &transfer : transfers)
+            {
+                if (!host.writeGuest(transfer.destination, transfer.bytes.data(), transfer.bytes.size()))
+                {
+                    log(LogLevel::Error, "[IOP_SIF0_CHAIN_REJECTED] EE destination write failed after validation");
+                    return;
+                }
+            }
+
+            if (std::getenv("PS2X_SIF_TRACE_DATA") != nullptr)
+            {
+                std::ostringstream out;
+                out << "[IOP_SIF0_CHAIN] tadr=0x" << std::hex << dma->tadr
+                    << " tags=" << std::dec << transfers.size()
+                    << " bytes=" << totalBytes
+                    << " final_madr=0x" << std::hex << finalMadr
+                    << " final_tadr=0x" << finalTadr
+                    << " interrupt_output=" << (interruptOutput ? "true" : "false");
+                for (const Sif0Transfer &transfer : transfers)
+                {
+                    out << " transfer{src=0x" << std::hex << transfer.source
+                        << ",dst=0x" << transfer.destination
+                        << ",bytes=0x" << transfer.size << "}";
+                    if (transfer.size <= 64u)
+                    {
+                        constexpr char hex[] = "0123456789abcdef";
+                        out << " data=";
+                        for (uint8_t byte : transfer.bytes)
+                        {
+                            out << hex[(byte >> 4u) & 0x0Fu] << hex[byte & 0x0Fu];
+                        }
+                    }
+                }
+                log(LogLevel::Info, out.str());
+            }
+
+            if (interruptOutput)
+                host.notifyEeSif0DmaComplete();
+
+            const int irq = interruptOutput ? kIopIrqDmaSif0 : kNoDmaInterrupt;
+            pendingDmaInterrupts[irq] = PendingDma{
+                irq,
+                totalCycles + dma->delayCycles,
+                9u,
+                finalMadr,
+                finalTadr,
+                true,
+                interruptOutput,
+            };
+        }
+
+        void serviceCdvdDevice()
+        {
+            if (!cdvd.serviceDevice())
+                return;
+
+            // CDVD command completion is delivered through the guest's
+            // registered IOP IRQ 2 handler. The one-cycle delay lets the
+            // current MMIO store retire before the handler reads I_STAT.
+            pendingDmaInterrupts[kIopIrqCdvd] = PendingDma{
+                kIopIrqCdvd, totalCycles + 1u, 0u, 0u, 0u, false, false};
         }
 
         bool readRam(uint32_t address, void *destination, size_t size) const
@@ -268,6 +457,21 @@ namespace ps2x::iop::detail
 
             if (iequals(call.library, "thbase") || iequals(call.library, "threadman"))
             {
+                if (std::getenv("PS2X_IOP_TRACE_THREAD_IMPORTS") != nullptr)
+                {
+                    static uint32_t emittedThreadImports = 0u;
+                    if (emittedThreadImports++ < 512u)
+                    {
+                        std::ostringstream out;
+                        out << "[IOP_THREAD_IMPORT] library=" << call.library
+                            << " ordinal=" << call.ordinal
+                            << " pc=0x" << std::hex << cpu.pc
+                            << " a0=0x" << cpu.gpr[4] << " a1=0x" << cpu.gpr[5]
+                            << " a2=0x" << cpu.gpr[6] << " a3=0x" << cpu.gpr[7]
+                            << " ra=0x" << cpu.gpr[31];
+                        log(LogLevel::Info, out.str());
+                    }
+                }
                 return kernel.dispatchThreadImport(call.ordinal, cpu, totalCycles)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
@@ -286,6 +490,20 @@ namespace ps2x::iop::detail
             }
             if (iequals(call.library, "sifcmd"))
             {
+                const uint32_t guestTarget = imports.resolve(call.library, call.ordinal, call.version);
+                if (guestTarget != 0u)
+                {
+                    if (std::getenv("PS2X_SIF_TRACE_DATA") != nullptr)
+                    {
+                        std::ostringstream out;
+                        out << "[IOP_GUEST_IMPORT] library=sifcmd ordinal=" << call.ordinal
+                            << " target=0x" << std::hex << guestTarget;
+                        log(LogLevel::Info, out.str());
+                    }
+                    cpu.pc = guestTarget;
+                    cpu.branchPending = false;
+                    return ImportDisposition::JumpToGuest;
+                }
                 return rpc.dispatchSifCmdImport(call.ordinal, cpu)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
@@ -314,10 +532,87 @@ namespace ps2x::iop::detail
                 setV0(0);
                 return ImportDisposition::Handled;
             }
-            if (iequals(call.library, "ioman") && ioman.dispatchImport(call.ordinal, cpu, *this))
-                return ImportDisposition::Handled;
+            if (iequals(call.library, "ioman"))
+            {
+                const uint32_t guestTarget = imports.resolve(call.library, call.ordinal, call.version);
+                if (guestTarget != 0u)
+                {
+                    if (std::getenv("PS2X_IOP_IOMAN_TRACE") != nullptr)
+                    {
+                        std::ostringstream out;
+                        out << "[IOP_GUEST_IMPORT] library=ioman ordinal=" << call.ordinal
+                            << " target=0x" << std::hex << guestTarget;
+                        if (call.ordinal == 20u)
+                        {
+                            const uint32_t descriptor = cpu.gpr[4];
+                            const uint32_t namePointer = memory.read32(descriptor);
+                            const uint32_t opsPointer = memory.read32(descriptor + 16u);
+                            out << " adddrv_a0=0x" << descriptor
+                                << " name_ptr=0x" << namePointer
+                                << " name='" << memory.readString(namePointer, 64u) << "'"
+                                << " ops_ptr=0x" << opsPointer;
+                            if (opsPointer != 0u)
+                            {
+                                out << " init=0x" << memory.read32(opsPointer)
+                                    << " deinit=0x" << memory.read32(opsPointer + 4u);
+                            }
+                        }
+                        else if (call.ordinal == 4u)
+                        {
+                            out << " open_path_ptr=0x" << cpu.gpr[4]
+                                << " open_path='" << memory.readString(cpu.gpr[4], 256u) << "'"
+                                << " mode=0x" << cpu.gpr[5]
+                                << " caller_ra=0x" << cpu.gpr[31]
+                                << " caller_gp=0x" << cpu.gpr[28]
+                                << " caller_s0=0x" << cpu.gpr[16]
+                                << " caller_s2=0x" << cpu.gpr[18]
+                                << " caller_s2_word=0x" << memory.read32(cpu.gpr[18])
+                                << " caller_s2_string='" << memory.readString(cpu.gpr[18], 128u) << "'"
+                                << " caller_s4=0x" << cpu.gpr[20];
+                        }
+                        log(LogLevel::Info, out.str());
+                    }
+                    cpu.pc = guestTarget;
+                    cpu.branchPending = false;
+                    return ImportDisposition::JumpToGuest;
+                }
+                if (ioman.dispatchImport(call.ordinal, cpu, *this))
+                    return ImportDisposition::Handled;
+            }
             if (iequals(call.library, "sifman"))
             {
+                const uint32_t guestTarget = imports.resolve(call.library, call.ordinal, call.version);
+                if (guestTarget != 0u)
+                {
+                    if (std::getenv("PS2X_SIF_TRACE_DATA") != nullptr)
+                    {
+                        std::ostringstream out;
+                        out << "[IOP_GUEST_IMPORT] library=sifman ordinal=" << call.ordinal
+                            << " target=0x" << std::hex << guestTarget;
+                        log(LogLevel::Info, out.str());
+                    }
+                    cpu.pc = guestTarget;
+                    cpu.branchPending = false;
+                    return ImportDisposition::JumpToGuest;
+                }
+                if (call.ordinal == 7u && std::getenv("PS2X_ARMAGEDDON_GUEST_SIF_ONLY") != nullptr)
+                {
+                    std::ostringstream out;
+                    out << "[IOP_SIF_HLE_REJECTED] library=sifman ordinal=7"
+                        << " pc=0x" << std::hex << cpu.pc
+                        << " reason=Armageddon requires original guest sceSifSetDma";
+                    log(LogLevel::Error, out.str());
+                    cpu.stopped = true;
+                    cpu.exception = true;
+                    return ImportDisposition::Missing;
+                }
+                if (call.ordinal == 7u && std::getenv("PS2X_SIF_TRACE_DATA") != nullptr)
+                {
+                    std::ostringstream out;
+                    out << "[IOP_SIF_HLE_FALLBACK] library=sifman ordinal=7"
+                        << " pc=0x" << std::hex << cpu.pc;
+                    log(LogLevel::Warning, out.str());
+                }
                 return rpc.dispatchSifManImport(call.ordinal, cpu)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
@@ -335,6 +630,20 @@ namespace ps2x::iop::detail
                 return ImportDisposition::Handled;
             if (iequals(call.library, "sysclib"))
             {
+                const uint32_t guestTarget = imports.resolve(call.library, call.ordinal, call.version);
+                if (guestTarget != 0u)
+                {
+                    if (std::getenv("PS2X_IOP_SYSCLIB_TRACE") != nullptr)
+                    {
+                        std::ostringstream out;
+                        out << "[IOP_GUEST_IMPORT] library=sysclib ordinal=" << call.ordinal
+                            << " target=0x" << std::hex << guestTarget;
+                        log(LogLevel::Info, out.str());
+                    }
+                    cpu.pc = guestTarget;
+                    cpu.branchPending = false;
+                    return ImportDisposition::JumpToGuest;
+                }
                 return sysclib.dispatchImport(call.ordinal, cpu)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
@@ -354,7 +663,8 @@ namespace ps2x::iop::detail
             out << "[IOP] unhandled import " << call.library << ':' << call.ordinal
                 << " version=0x" << std::hex << call.version << " pc=0x" << cpu.pc;
             log(LogLevel::Warning, out.str());
-            setV0(0);
+            cpu.stopped = true;
+            cpu.exception = true;
             return ImportDisposition::Missing;
         }
 
@@ -381,6 +691,7 @@ namespace ps2x::iop::detail
             if (const auto import = imports.decode(cpu.pc))
             {
                 const ImportDisposition disposition = dispatchImport(*import, cpu);
+                serviceCdvdDevice();
                 ++totalInstructions;
                 ++totalCycles;
                 if (disposition == ImportDisposition::JumpToGuest)
@@ -392,6 +703,7 @@ namespace ps2x::iop::detail
 
             const bool running = cpuCore.executeInstruction(cpu);
             schedulePendingDma();
+            serviceCdvdDevice();
             ++totalInstructions;
             ++totalCycles;
             return running;
@@ -455,7 +767,9 @@ namespace ps2x::iop::detail
                 cpu.gpr[29] = kCallStackBase - 32u;
             }
             cpu.gpr[31] = kCallReturnSentinel;
-            runCpu(cpu, budget);
+            lastCallInstructions = runCpu(cpu, budget);
+            lastCallCompleted = cpu.pc == kCallReturnSentinel && !cpu.exception;
+            lastCallStopPc = cpu.pc;
             return cpu.gpr[2];
         }
 
@@ -488,21 +802,52 @@ namespace ps2x::iop::detail
 
             servicingDmaInterrupts = true;
 
-            std::vector<int> completed;
+            std::vector<PendingDma> completed;
             for (auto it = pendingDmaInterrupts.begin(); it != pendingDmaInterrupts.end();)
             {
-                if (it->second > totalCycles)
+                if (it->second.completionCycle > totalCycles)
                 {
                     ++it;
                     continue;
                 }
-                completed.push_back(it->first);
+                completed.push_back(it->second);
                 it = pendingDmaInterrupts.erase(it);
             }
             try
             {
-                for (const int irq : completed)
-                    (void)intrman.dispatchInterrupt(irq, *this);
+                for (const PendingDma &dma : completed)
+                {
+                    if (dma.sif0)
+                    {
+                        memory.completeSif0Dma(dma.finalMadr, dma.finalTadr, dma.interruptOutput);
+                        // The DMAC completion controller acknowledges DICR2's
+                        // channel-9 flag before calling the registered SIFMAN
+                        // handler. The guest handler therefore sees CHCR idle
+                        // and may start the next queued SIF0 chain.
+                        if (dma.interruptOutput)
+                            memory.acknowledgeSif0DmaInterrupt();
+                    }
+
+                    if (dma.irq < 0)
+                        continue;
+                    const bool dispatched = intrman.dispatchInterrupt(dma.irq, *this);
+                    if (dma.irq == kIopIrqDmaSif1 && std::getenv("PS2X_SIF_TRACE_DATA") != nullptr)
+                    {
+                        std::ostringstream out;
+                        out << "[SIF1_IRQ_DISPATCH] cycle=" << totalCycles
+                            << " irq=0x" << std::hex << dma.irq << std::dec
+                            << " handler_dispatched=" << (dispatched ? "true" : "false");
+                        log(LogLevel::Info, out.str());
+                    }
+                    if (dma.irq == kIopIrqDmaSif0 && std::getenv("PS2X_SIF_TRACE_DATA") != nullptr)
+                    {
+                        std::ostringstream out;
+                        out << "[SIF0_IRQ_DISPATCH] cycle=" << totalCycles
+                            << " irq=0x" << std::hex << dma.irq << std::dec
+                            << " handler_dispatched=" << (dispatched ? "true" : "false");
+                        log(LogLevel::Info, out.str());
+                    }
+                }
             }
             catch (...)
             {
@@ -567,8 +912,11 @@ namespace ps2x::iop::detail
                     if (!next)
                     {
                         uint64_t nextWake = kernel.nextWakeCycle(target);
-                        for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
-                            nextWake = std::min(nextWake, completionCycle);
+                        for (const auto &[irq, dma] : pendingDmaInterrupts)
+                        {
+                            (void)irq;
+                            nextWake = std::min(nextWake, dma.completionCycle);
+                        }
                         if (!pendingGuestCallbacks.empty())
                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
                         nextWake = timrman.nextEventCycle(nextWake);
@@ -576,8 +924,15 @@ namespace ps2x::iop::detail
                         continue;
                     }
                     const uint64_t before = totalCycles;
-                    runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
-                    kernel.endTimeslice(*next, kThreadReturnSentinel);
+                    const int threadId = next->id;
+                    const uint32_t executed = runCpu(next->cpu,
+                                                     static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
+                    if (IopThread *thread = kernel.findThread(threadId))
+                    {
+                        thread->instructionsExecuted += executed;
+                        kernel.endTimeslice(*thread, kThreadReturnSentinel);
+                    }
+                    refreshPendingModuleStarts();
                     if (totalCycles == before)
                         ++totalCycles;
                 }
@@ -588,7 +943,82 @@ namespace ps2x::iop::detail
             }
         }
 
-        ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
+        void refreshPendingModuleStarts()
+        {
+            for (auto &[moduleId, module] : modules)
+            {
+                (void)moduleId;
+                if (!module.startPending)
+                    continue;
+                const IopThread *thread = kernel.findThread(module.startThreadId);
+                if (!thread)
+                {
+                    module.startPending = false;
+                    module.startReturned = false;
+                    module.startResult = -1;
+                    module.startStopPc = 0u;
+                    if (module.startArguments != 0u)
+                        freeAllocation(module.startArguments);
+                    module.startArguments = 0u;
+                    module.startThreadId = 0;
+                    continue;
+                }
+                if (thread->state != IopThreadState::Dormant && thread->state != IopThreadState::Dead)
+                    continue;
+
+                module.startReturned = thread->cpu.pc == kThreadReturnSentinel && !thread->cpu.exception;
+                module.startResult = module.startReturned ? static_cast<int32_t>(thread->cpu.gpr[2]) : -1;
+                module.startStopPc = thread->cpu.pc;
+                module.startInstructions = thread->instructionsExecuted;
+                module.startPending = false;
+                module.resident = module.startReturned &&
+                                  (module.startResult == 0 || module.startResult == 2);
+                if (module.startArguments != 0u)
+                    freeAllocation(module.startArguments);
+                module.startArguments = 0u;
+                module.startThreadId = 0;
+                (void)kernel.releaseThread(thread->id);
+            }
+        }
+
+        IopModuleStartState moduleStartState(int32_t moduleId)
+        {
+            refreshPendingModuleStarts();
+            IopModuleStartState result{};
+            const auto found = modules.find(moduleId);
+            if (found == modules.end())
+                return result;
+            const Module &module = found->second;
+            result.found = true;
+            result.pending = module.startPending;
+            result.returned = module.startReturned;
+            result.moduleId = module.id;
+            result.startResult = module.startResult;
+            result.entry = module.entry;
+            result.stopPc = module.startStopPc;
+            result.instructions = module.startInstructions;
+            if (module.startPending)
+            {
+                if (const IopThread *thread = kernel.findThread(module.startThreadId))
+                {
+                    result.threadId = static_cast<uint32_t>(thread->id);
+                    result.threadState = static_cast<uint32_t>(thread->state);
+                    result.currentPc = thread->cpu.pc;
+                    result.waitId = static_cast<uint32_t>(thread->waitId);
+                    result.waitBits = thread->waitBits;
+                    result.instructions = thread->instructionsExecuted;
+                    result.a0 = thread->cpu.gpr[4];
+                    result.a1 = thread->cpu.gpr[5];
+                    result.ra = thread->cpu.gpr[31];
+                }
+            }
+            return result;
+        }
+
+        ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image,
+                                   const void *arguments, uint32_t argumentSize,
+                                   bool scheduleStart = false,
+                                   std::optional<uint32_t> moduleStartArgc = std::nullopt)
         {
             ModuleLoadResult result{true, -1, -1};
             const IopImageLoadResult loaded = IopModuleLoader::load(image, memory, moduleCursor);
@@ -599,6 +1029,11 @@ namespace ps2x::iop::detail
                     log(LogLevel::Error, "[IOP] rejected invalid/non-MIPS IRX ELF");
                 else if (loaded.error == IopImageLoadError::ArenaExhausted)
                     log(LogLevel::Error, "[IOP] module arena exhausted");
+                return result;
+            }
+            if (!memory.registerModuleImage(loaded.base, loaded.size))
+            {
+                log(LogLevel::Error, "[IOP] module image overlaps a reserved or allocated system-memory block");
                 return result;
             }
             if (!loaded.relocationsComplete)
@@ -614,6 +1049,19 @@ namespace ps2x::iop::detail
             module.entry = loaded.entry;
             module.gp = loaded.gp;
 
+            if (module.path.size() >= 8u &&
+                iequals(std::string_view(module.path).substr(module.path.size() - 8u), "#CDVDMAN"))
+            {
+                const bool mediaPresent = cdvd.prepareDeviceState();
+                if (std::getenv("PS2X_IOP_CDVD_TRACE") != nullptr)
+                {
+                    std::ostringstream out;
+                    out << "[IOP_CDVD_MEDIA] source=host-image-or-root present="
+                        << (mediaPresent ? "true" : "false");
+                    log(LogLevel::Info, out.str());
+                }
+            }
+
             uint32_t args = 0u;
             if (arguments && argumentSize)
             {
@@ -624,9 +1072,51 @@ namespace ps2x::iop::detail
                     write8(args + argumentSize, 0u);
                 }
             }
+            if (scheduleStart)
+            {
+                const uint32_t startArgc = moduleStartArgc.value_or(argumentSize);
+                const int threadId = kernel.scheduleFunction(module.entry, startArgc, args, 0u, 0u, module.gp);
+                if (threadId <= 0)
+                {
+                    if (args != 0u)
+                        freeAllocation(args);
+                    (void)memory.unregisterModuleImage(module.base, module.size);
+                    return result;
+                }
+                module.startPending = true;
+                module.startThreadId = threadId;
+                module.startArguments = args;
+                const int32_t moduleId = module.id;
+                modules[module.id] = std::move(module);
+                result.moduleId = moduleId;
+                result.startResult = -1;
+                result.startPending = true;
+                std::ostringstream out;
+                out << "[IOP] scheduled IRX module_start id=" << moduleId
+                    << " entry=0x" << std::hex << modules[moduleId].entry;
+                log(LogLevel::Info, out.str());
+                return result;
+            }
             const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
             if (args)
                 freeAllocation(args);
+            if (!lastCallCompleted)
+            {
+                // Exhaustion/yield/fault is not a returned MODULE_RESIDENT_END.
+                // Do not publish partially initialized exports or RPC servers.
+                kernel.terminateThreadsInRange(module.base, module.size);
+                rpc.removeServersInRange(module.base, module.size);
+                imports.eraseRange(module.base, module.size);
+                kernel.cleanupDeadThreads();
+                (void)memory.unregisterModuleImage(module.base, module.size);
+                std::ostringstream error;
+                error << "[IOP] module start did not return entry=0x" << std::hex << module.entry
+                      << " stop_pc=0x" << lastCallStopPc << std::dec
+                      << " instructions=" << lastCallInstructions;
+                lastError = error.str();
+                log(LogLevel::Error, lastError);
+                return result;
+            }
             module.resident = startResult == 0u || startResult == 2u;
             result.moduleId = module.id;
             result.startResult = static_cast<int32_t>(startResult);
@@ -652,6 +1142,31 @@ namespace ps2x::iop::detail
             return loadImage(std::string(path), image, arguments, argumentSize);
         }
 
+        ModuleLoadResult loadModuleScheduled(std::string_view path, const void *arguments, uint32_t argumentSize)
+        {
+            std::vector<uint8_t> image;
+            if (!IopModuleLoader::readWholeHostFile(host, path, image))
+            {
+                log(LogLevel::Warning, std::string("[IOP] failed to open IRX '") + std::string(path) + "'");
+                return {true, -1, -1, false};
+            }
+            return loadImage(std::string(path), image, arguments, argumentSize, true);
+        }
+
+        ModuleLoadResult loadModuleScheduledWithArgc(std::string_view path,
+                                                      const void *arguments,
+                                                      uint32_t argumentSize,
+                                                      uint32_t argumentCount)
+        {
+            std::vector<uint8_t> image;
+            if (!IopModuleLoader::readWholeHostFile(host, path, image))
+            {
+                log(LogLevel::Warning, std::string("[IOP] failed to open IRX '") + std::string(path) + "'");
+                return {true, -1, -1, false};
+            }
+            return loadImage(std::string(path), image, arguments, argumentSize, true, argumentCount);
+        }
+
         ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
         {
             std::vector<uint8_t> image;
@@ -660,6 +1175,131 @@ namespace ps2x::iop::detail
             std::ostringstream tag;
             tag << "buffer@0x" << std::hex << guestAddress;
             return loadImage(tag.str(), image, arguments, argumentSize);
+        }
+
+        ModuleLoadResult loadModuleBufferScheduled(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
+        {
+            std::vector<uint8_t> image;
+            if (!IopModuleLoader::readElfFromGuest(host, guestAddress, image))
+                return {true, -1, -1, false};
+            std::ostringstream tag;
+            tag << "buffer@0x" << std::hex << guestAddress;
+            return loadImage(tag.str(), image, arguments, argumentSize, true);
+        }
+
+        ModuleLoadResult loadRomDirModuleScheduled(std::string_view imagePath,
+                                                   std::string_view moduleName,
+                                                   const void *arguments,
+                                                   uint32_t argumentSize,
+                                                   std::optional<uint32_t> moduleStartArgc = std::nullopt)
+        {
+            std::vector<uint8_t> image;
+            std::vector<uint8_t> moduleImage;
+            if (!IopModuleLoader::readWholeHostFile(host, imagePath, image) ||
+                !IopModuleLoader::extractRomDirModule(image, moduleName, moduleImage))
+            {
+                std::ostringstream error;
+                error << "[IOP] ROMDIR module unavailable image='" << imagePath
+                      << "' module='" << moduleName << "'";
+                lastError = error.str();
+                log(LogLevel::Warning, lastError);
+                return {true, -1, -1, false};
+            }
+            std::string modulePath(imagePath);
+            modulePath.push_back('#');
+            modulePath.append(moduleName);
+            return loadImage(std::move(modulePath), moduleImage, arguments, argumentSize, true, moduleStartArgc);
+        }
+
+        IopCallResult callExport(std::string_view library, uint16_t ordinal,
+                                 uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                 uint32_t instructionBudget)
+        {
+            IopCallResult result{};
+            if (instructionBudget == 0u)
+                return result;
+            const uint32_t target = imports.resolve(library, ordinal);
+            if (target == 0u)
+                return result;
+            const auto owner = std::find_if(modules.begin(), modules.end(), [&](const auto &item)
+            {
+                const Module &module = item.second;
+                return target >= module.base && target - module.base < module.size;
+            });
+            if (owner == modules.end())
+                return result;
+            result.found = true;
+            result.entry = target;
+            result.value = callFunction(target, a0, a1, a2, a3, owner->second.gp, instructionBudget);
+            result.returned = lastCallCompleted;
+            result.stopPc = lastCallStopPc;
+            result.instructions = lastCallInstructions;
+            return result;
+        }
+
+        IopScheduledCall scheduleExportCall(std::string_view library, uint16_t ordinal,
+                                            uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3)
+        {
+            IopScheduledCall result{};
+            const uint32_t target = imports.resolve(library, ordinal);
+            if (target == 0u)
+                return result;
+            const auto owner = std::find_if(modules.begin(), modules.end(), [&](const auto &item)
+            {
+                const Module &module = item.second;
+                return target >= module.base && target - module.base < module.size;
+            });
+            if (owner == modules.end())
+                return result;
+
+            const int threadId = kernel.scheduleFunction(target, a0, a1, a2, a3, owner->second.gp);
+            if (threadId <= 0)
+                return result;
+            uint32_t callId = nextScheduledCallId++;
+            if (callId == 0u)
+                callId = nextScheduledCallId++;
+            scheduledExportCalls.emplace(callId, ScheduledExportCall{threadId, target});
+            result.found = true;
+            result.id = callId;
+            result.entry = target;
+            return result;
+        }
+
+        IopScheduledCallState scheduledCallState(uint32_t callId) const
+        {
+            IopScheduledCallState result{};
+            const auto call = scheduledExportCalls.find(callId);
+            if (call == scheduledExportCalls.end())
+                return result;
+            result.found = true;
+            result.entry = call->second.entry;
+            const IopThread *thread = kernel.findThread(call->second.threadId);
+            if (!thread)
+            {
+                result.finished = true;
+                return result;
+            }
+            result.finished = thread->state == IopThreadState::Dormant ||
+                              thread->state == IopThreadState::Dead;
+            result.returned = thread->cpu.pc == kThreadReturnSentinel && !thread->cpu.exception;
+            result.stopPc = thread->cpu.pc;
+            result.instructions = thread->instructionsExecuted;
+            result.value = thread->cpu.gpr[2];
+            return result;
+        }
+
+        bool releaseScheduledCall(uint32_t callId)
+        {
+            const auto call = scheduledExportCalls.find(callId);
+            if (call == scheduledExportCalls.end())
+                return false;
+            const IopThread *thread = kernel.findThread(call->second.threadId);
+            if (thread && thread->state == IopThreadState::Running)
+                return false;
+            if (thread && !kernel.releaseThread(call->second.threadId))
+                return false;
+            scheduledExportCalls.erase(call);
+            return true;
         }
 
         bool stopModule(int32_t moduleId, int32_t *result)
@@ -671,6 +1311,7 @@ namespace ps2x::iop::detail
             kernel.terminateThreadsInRange(it->second.base, it->second.size);
             rpc.removeServersInRange(it->second.base, it->second.size);
             imports.eraseRange(it->second.base, it->second.size);
+            (void)memory.unregisterModuleImage(it->second.base, it->second.size);
             modules.erase(it);
             kernel.cleanupDeadThreads();
             if (result)
@@ -695,14 +1336,24 @@ namespace ps2x::iop::detail
         IopImportRegistry imports;
         IopLoadcore loadcore;
         std::map<int, Module> modules;
-        std::map<int, uint64_t> pendingDmaInterrupts;
+        std::map<int, PendingDma> pendingDmaInterrupts;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
         uint32_t nextModuleId = 1;
         uint32_t moduleCursor = kModuleLoadBase;
+        struct ScheduledExportCall
+        {
+            int threadId = 0;
+            uint32_t entry = 0;
+        };
+        std::map<uint32_t, ScheduledExportCall> scheduledExportCalls;
+        uint32_t nextScheduledCallId = 1u;
         uint64_t totalCycles = 0;
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
         CpuState *activeCpu = nullptr;
+        bool lastCallCompleted = false;
+        uint32_t lastCallStopPc = 0;
+        uint32_t lastCallInstructions = 0;
         std::string lastError;
         bool servicingDmaInterrupts = false;
         bool servicingGuestCallbacks = false;
@@ -734,6 +1385,74 @@ namespace ps2x::iop::detail
         return m_impl->loadModuleBuffer(guestAddress, arguments, argumentSize);
     }
 
+    ModuleLoadResult IopEmulator::loadModuleScheduled(std::string_view path,
+                                                      const void *arguments,
+                                                      uint32_t argumentSize)
+    {
+        return m_impl->loadModuleScheduled(path, arguments, argumentSize);
+    }
+
+    ModuleLoadResult IopEmulator::loadModuleScheduledWithArgc(std::string_view path,
+                                                               const void *arguments,
+                                                               uint32_t argumentSize,
+                                                               uint32_t argumentCount)
+    {
+        return m_impl->loadModuleScheduledWithArgc(path, arguments, argumentSize, argumentCount);
+    }
+
+    ModuleLoadResult IopEmulator::loadModuleBufferScheduled(uint32_t guestAddress,
+                                                            const void *arguments,
+                                                            uint32_t argumentSize)
+    {
+        return m_impl->loadModuleBufferScheduled(guestAddress, arguments, argumentSize);
+    }
+
+    ModuleLoadResult IopEmulator::loadRomDirModuleScheduled(std::string_view imagePath,
+                                                            std::string_view moduleName,
+                                                            const void *arguments,
+                                                            uint32_t argumentSize)
+    {
+        return m_impl->loadRomDirModuleScheduled(imagePath, moduleName, arguments, argumentSize);
+    }
+
+    ModuleLoadResult IopEmulator::loadRomDirModuleScheduledWithArgc(std::string_view imagePath,
+                                                                    std::string_view moduleName,
+                                                                    const void *arguments,
+                                                                    uint32_t argumentSize,
+                                                                    uint32_t argumentCount)
+    {
+        return m_impl->loadRomDirModuleScheduled(imagePath, moduleName, arguments, argumentSize,
+                                                 argumentCount);
+    }
+
+    IopModuleStartState IopEmulator::moduleStartState(int32_t moduleId)
+    {
+        return m_impl->moduleStartState(moduleId);
+    }
+
+    IopCallResult IopEmulator::callExport(std::string_view library, uint16_t ordinal,
+                                          uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                          uint32_t instructionBudget)
+    {
+        return m_impl->callExport(library, ordinal, a0, a1, a2, a3, instructionBudget);
+    }
+
+    IopScheduledCall IopEmulator::scheduleExportCall(std::string_view library, uint16_t ordinal,
+                                                     uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3)
+    {
+        return m_impl->scheduleExportCall(library, ordinal, a0, a1, a2, a3);
+    }
+
+    IopScheduledCallState IopEmulator::scheduledCallState(uint32_t callId) const
+    {
+        return m_impl->scheduledCallState(callId);
+    }
+
+    bool IopEmulator::releaseScheduledCall(uint32_t callId)
+    {
+        return m_impl->releaseScheduledCall(callId);
+    }
+
     bool IopEmulator::stopModule(int32_t moduleId, int32_t *result)
     {
         return m_impl->stopModule(moduleId, result);
@@ -761,6 +1480,25 @@ namespace ps2x::iop::detail
     void IopEmulator::onSifTransfer(const SifTransfer &transfer)
     {
         m_impl->rpc.onSifTransfer(transfer);
+        if (transfer.kind == SifTransferKind::SetDma &&
+            transfer.phase == SifTransferPhase::AfterCopy)
+        {
+            // The transfer payload is already in IOP RAM at this point. Queue
+            // SIF1 completion so a registered guest handler (for example the
+            // retail SIFCMD command interrupt handler) runs when the IOP gets
+            // its next scheduler slice. Hardware latency remains uncalibrated.
+            if (std::getenv("PS2X_SIF_TRACE_DATA") != nullptr)
+            {
+                std::ostringstream out;
+                out << "[SIF1_DMA_RECEIVE] source=0x" << std::hex << transfer.sourceAddress
+                    << " destination=0x" << transfer.destinationAddress
+                    << " size=0x" << transfer.size << std::dec
+                    << " cycle=" << m_impl->totalCycles;
+                m_impl->log(LogLevel::Info, out.str());
+            }
+            m_impl->pendingDmaInterrupts[kIopIrqDmaSif1] = IopEmulator::Impl::PendingDma{
+                kIopIrqDmaSif1, m_impl->totalCycles, 10u, 0u, 0u, false, false};
+        }
     }
 
     uint32_t IopEmulator::allocateMemory(uint32_t size, uint32_t alignment)
@@ -793,6 +1531,21 @@ namespace ps2x::iop::detail
     bool IopEmulator::writeSifRegisterFromEe(uint32_t index, uint32_t value)
     {
         return m_impl->memory.writeSifRegisterFromEe(index, value);
+    }
+
+    bool IopEmulator::writeSifRegisterFromIop(uint32_t index, uint32_t value)
+    {
+        return m_impl->memory.writeSifRegisterFromIop(index, value);
+    }
+
+    bool IopEmulator::prepareCdvdDeviceState()
+    {
+        return m_impl->cdvd.prepareDeviceState();
+    }
+
+    bool IopEmulator::setRom0Image(std::span<const uint8_t> image)
+    {
+        return m_impl->memory.setRom0Image(image);
     }
 
     bool IopEmulator::zeroMemory(uint32_t address, size_t size)

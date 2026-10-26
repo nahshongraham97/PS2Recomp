@@ -24,6 +24,7 @@
 #include <unordered_set>
 
 #include "ps2_log.h"
+#include "armageddon_diagnostic_budget.h"
 #include "runtime/ps2_address.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/ps2_memory.h"
@@ -286,12 +287,22 @@ public:
     ~PS2Runtime();
 
     bool initialize(const char *title = "PS2 Game");
+#include "armageddon_diagnostic_runtime_extension.h"
     bool syncCoreSubsystems();
     bool loadELF(const std::string &elfPath);
     void run();
 
     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
+    [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModuleScheduled(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
+    [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModuleBufferScheduled(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
+    [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopRomDirModuleScheduled(std::string_view imagePath, std::string_view moduleName, const void *arguments = nullptr, uint32_t argumentSize = 0);
+    [[nodiscard]] ps2x::iop::IopModuleStartState iopModuleStartState(int32_t moduleId);
+    [[nodiscard]] ps2x::iop::IopScheduledCall scheduleIopExportCall(std::string_view library, uint16_t ordinal,
+                                                                    uint32_t a0 = 0u, uint32_t a1 = 0u,
+                                                                    uint32_t a2 = 0u, uint32_t a3 = 0u);
+    [[nodiscard]] ps2x::iop::IopScheduledCallState iopScheduledCallState(uint32_t callId) const;
+    [[nodiscard]] bool releaseIopScheduledCall(uint32_t callId);
     [[nodiscard]] bool stopIopModule(int32_t moduleId, int32_t *result = nullptr);
     [[nodiscard]] ps2x::iop::DebugSnapshot iopDebugSnapshot() const;
     uint32_t allocateIopMemory(uint32_t size, uint32_t alignment = 16u);
@@ -300,6 +311,8 @@ public:
     bool writeIopMemory(uint32_t address, const void *source, size_t size);
     bool zeroIopMemory(uint32_t address, size_t size);
     bool isIopMemoryRange(uint32_t address, size_t size) const;
+    bool readIopSifRegister(uint32_t index, uint32_t &value) const;
+    bool writeIopSifRegisterFromEe(uint32_t index, uint32_t value);
 
     using DebugUiCallback = void (*)(PS2Runtime &runtime, void *userData);
     void setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -483,6 +496,7 @@ private:
     void notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer);
     void advanceIopEeCycles(uint64_t eeCycles) noexcept;
     void resetIop();
+    bool bootstrapArmageddonIopFromRom0(const std::filesystem::path &rom0Path);
 
     friend class PS2IopTransport;
     friend class EeScheduler;

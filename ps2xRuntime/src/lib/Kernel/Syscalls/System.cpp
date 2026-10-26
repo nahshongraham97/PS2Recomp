@@ -382,7 +382,10 @@ namespace ps2_syscalls
             }
         }
 
-        // Bootstrap default: avoid hard-failing loops that probe syscall availability.
+        // Strict diagnostic collection must not turn unknown syscalls into success.
+        if (runtime && runtime->diagnosticUnsupportedSyscall(ctx, syscallId))
+            throw EeDispatcherTransfer{};
+        // Bootstrap default retained for existing non-diagnostic runtime behavior.
         setReturnS32(ctx, 0);
     }
 
@@ -405,6 +408,8 @@ namespace ps2_syscalls
 
         if (!runtime->hasFunction(handler))
         {
+            if (runtime->diagnosticMissingSyscallOverride(ctx, syscallNumber, handler))
+                throw EeDispatcherTransfer{};
             setReturnS32(ctx, KE_ERROR);
             return true;
         }

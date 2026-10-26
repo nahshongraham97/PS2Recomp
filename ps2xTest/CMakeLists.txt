@@ -107,6 +107,23 @@ target_link_libraries(ps2x_sif_tests PRIVATE
 
 if(BUILD_TESTING)
     add_test(NAME ps2x_sif_tests COMMAND ps2x_sif_tests)
+
+    # Keep kernel/scheduler regressions independently runnable when optional
+    # recompiler test dependencies (such as ELFIO) are unavailable.
+    add_executable(ps2x_runtime_kernel_tests
+        src/kernel_test_main.cpp
+        src/ps2_runtime_kernel_tests.cpp
+        $<TARGET_OBJECTS:ps2_test_function_table>
+    )
+    target_include_directories(ps2x_runtime_kernel_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+        ${CMAKE_SOURCE_DIR}/ps2xRuntime/src/lib
+        ${CMAKE_SOURCE_DIR}/ps2xRuntime/src/lib/Kernel
+        ${CMAKE_SOURCE_DIR}/ps2xIOP/include
+    )
+    target_link_libraries(ps2x_runtime_kernel_tests PRIVATE ps2_runtime ps2_iop)
+    add_test(NAME ps2x_runtime_kernel_tests COMMAND ps2x_runtime_kernel_tests)
 endif()
 
 # VU/GS tests intentionally instantiate large interpreter state.

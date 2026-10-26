@@ -41,6 +41,7 @@ namespace ps2x::iop::detail
         uint32_t waitMode = 0;
         uint32_t waitResultAddress = 0;
         int wakeupCount = 0;
+        uint64_t instructionsExecuted = 0;
     };
 
     class IopKernel
@@ -61,6 +62,11 @@ namespace ps2x::iop::detail
         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
 
         [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
+        [[nodiscard]] int scheduleFunction(uint32_t entry, uint32_t a0, uint32_t a1,
+                                           uint32_t a2, uint32_t a3, uint32_t gp);
+        [[nodiscard]] IopThread *findThread(int id) noexcept;
+        [[nodiscard]] const IopThread *findThread(int id) const noexcept;
+        [[nodiscard]] bool releaseThread(int id);
         [[nodiscard]] uint64_t nextWakeCycle(uint64_t fallback) const;
         void endTimeslice(IopThread &thread, uint32_t returnSentinel);
         void cleanupDeadThreads();
@@ -98,6 +104,7 @@ namespace ps2x::iop::detail
         uint32_t m_nextThreadId = 1;
         uint32_t m_nextSemaphoreId = 1;
         uint32_t m_nextEventFlagId = 1;
+        int m_systemStatusEventFlagId = 0;
         IopThread *m_currentThread = nullptr;
     };
 }

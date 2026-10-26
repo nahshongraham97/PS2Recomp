@@ -9,6 +9,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -62,26 +63,46 @@ namespace iop_test
         uint32_t allocateGuest(uint32_t, uint32_t) override { return 0u; }
         void freeGuest(uint32_t) override {}
         void audioCommand(uint32_t, uint32_t, GuestBuffer, GuestBuffer) override { ++audioCalls; }
-        std::string hostPath(HostPathKind) const override { return {}; }
+        std::string hostPath(HostPathKind kind) const override
+        {
+            return kind == HostPathKind::CdRoot ? cdRoot : std::string{};
+        }
         std::string translateGuestPath(std::string_view path) const override { return std::string(path); }
-        uint64_t openHostFile(std::string_view) override { return file.empty() ? 0u : 1u; }
+        uint64_t openHostFile(std::string_view path) override
+        {
+            const auto mapped = hostFiles.find(std::string(path));
+            const std::vector<uint8_t> *contents = mapped != hostFiles.end() ? &mapped->second : &file;
+            if (contents->empty())
+                return 0u;
+            const uint64_t handle = nextHostFileHandle++;
+            openHostFiles.emplace(handle, contents);
+            return handle;
+        }
         bool hostFileSize(uint64_t handle, uint64_t &size) const override
         {
-            size = file.size();
-            return handle == 1u && !file.empty();
+            const auto found = openHostFiles.find(handle);
+            if (found == openHostFiles.end() || !found->second)
+            {
+                size = 0u;
+                return false;
+            }
+            size = found->second->size();
+            return !found->second->empty();
         }
         bool readHostFile(uint64_t handle, uint64_t offset, void *destination, size_t size,
                           size_t &bytesRead) override
         {
             bytesRead = 0u;
-            if (handle != 1u || offset > file.size())
+            const auto found = openHostFiles.find(handle);
+            if (found == openHostFiles.end() || !found->second || offset > found->second->size())
                 return false;
-            bytesRead = std::min(size, file.size() - static_cast<size_t>(offset));
+            const std::vector<uint8_t> &contents = *found->second;
+            bytesRead = std::min(size, contents.size() - static_cast<size_t>(offset));
             if (bytesRead != 0u)
-                std::memcpy(destination, file.data() + offset, bytesRead);
+                std::memcpy(destination, contents.data() + offset, bytesRead);
             return true;
         }
-        void closeHostFile(uint64_t) override {}
+        void closeHostFile(uint64_t handle) override { openHostFiles.erase(handle); }
         int32_t memoryCard(const MemoryCardRequest &request) override
         {
             cardCalls.push_back(request);
@@ -108,6 +129,10 @@ namespace iop_test
 
         std::vector<uint8_t> guest;
         std::vector<uint8_t> file;
+        std::unordered_map<std::string, std::vector<uint8_t>> hostFiles;
+        mutable std::unordered_map<uint64_t, const std::vector<uint8_t> *> openHostFiles;
+        uint64_t nextHostFileHandle = 1u;
+        std::string cdRoot;
         std::vector<std::string> logs;
         std::vector<MemoryCardRequest> cardCalls;
         mutable size_t guestReads = 0u;

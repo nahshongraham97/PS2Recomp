@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -65,9 +66,23 @@ namespace
             return kind == HostPathKind::CdRoot ? cdRoot : std::string{};
         }
         std::string translateGuestPath(std::string_view path) const override { return std::string(path); }
-        uint64_t openHostFile(std::string_view) override { return 0u; }
-        bool hostFileSize(uint64_t, uint64_t &) const override { return false; }
-        bool readHostFile(uint64_t, uint64_t, void *, size_t, size_t &) override { return false; }
+        uint64_t openHostFile(std::string_view) override { return file.empty() ? 0u : 1u; }
+        bool hostFileSize(uint64_t handle, uint64_t &size) const override
+        {
+            size = file.size();
+            return handle == 1u && !file.empty();
+        }
+        bool readHostFile(uint64_t handle, uint64_t offset, void *destination, size_t size,
+                          size_t &bytesRead) override
+        {
+            bytesRead = 0u;
+            if (handle != 1u || offset > file.size() || (!destination && size != 0u))
+                return false;
+            bytesRead = std::min(size, file.size() - static_cast<size_t>(offset));
+            if (bytesRead != 0u)
+                std::memcpy(destination, file.data() + offset, bytesRead);
+            return true;
+        }
         void closeHostFile(uint64_t) override {}
         int32_t memoryCard(const MemoryCardRequest &) override { return 0; }
         bool hasGuestFunction(uint32_t) const override { return false; }
@@ -82,6 +97,7 @@ namespace
         void log(LogLevel, std::string_view message) override { logs.emplace_back(message); }
 
         std::vector<uint8_t> guest;
+        std::vector<uint8_t> file;
         std::vector<std::string> logs;
         std::string cdRoot;
         uint32_t sif0Notifications = 0u;
@@ -452,6 +468,29 @@ namespace
         std::memcpy(host.guest.data() + address + codeOffset + 0xC0u, importTable, sizeof(importTable));
     }
 
+    std::vector<uint8_t> makeRomDirImage(std::span<const uint8_t> module)
+    {
+        constexpr size_t directoryBytes = 4u * 16u;
+        const size_t alignedModuleBytes = (module.size() + 15u) & ~size_t{15u};
+        std::vector<uint8_t> image(directoryBytes + alignedModuleBytes, 0u);
+        const auto setEntry = [&](size_t index, std::string_view name, uint32_t size)
+        {
+            uint8_t *const record = image.data() + index * 16u;
+            std::memcpy(record, name.data(), std::min<size_t>(name.size(), 9u));
+            record[10] = 0u;
+            record[11] = 0u;
+            record[12] = static_cast<uint8_t>(size);
+            record[13] = static_cast<uint8_t>(size >> 8u);
+            record[14] = static_cast<uint8_t>(size >> 16u);
+            record[15] = static_cast<uint8_t>(size >> 24u);
+        };
+        setEntry(0u, "RESET", 0u);
+        setEntry(1u, "ROMDIR", static_cast<uint32_t>(directoryBytes));
+        setEntry(2u, "TEST", static_cast<uint32_t>(module.size()));
+        std::memcpy(image.data() + directoryBytes, module.data(), module.size());
+        return image;
+    }
+
     void writeExportConsumerIrx(TestHost &host, uint32_t address)
     {
         constexpr uint32_t codeOffset = 0x100u;
@@ -486,6 +525,105 @@ namespace
         std::memcpy(host.guest.data() + address, &header, sizeof(header));
         std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
         std::memcpy(host.guest.data() + address + codeOffset, code, sizeof(code));
+        std::memcpy(host.guest.data() + address + codeOffset + 0x40u, importTable, sizeof(importTable));
+    }
+
+    void writeGuestIomanProviderIrx(TestHost &host, uint32_t address)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00010000u;
+        constexpr uint32_t targetAddress = loadAddress + 0x60u;
+        constexpr uint32_t exportTableAddress = loadAddress + 0x80u;
+        constexpr uint32_t loadcoreImportAddress = loadAddress + 0x100u;
+        constexpr uint32_t loadcoreStubAddress = loadcoreImportAddress + 20u;
+        constexpr uint32_t iomanImportAddress = loadAddress + 0x120u;
+        constexpr uint32_t iomanStubAddress = iomanImportAddress + 20u;
+
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu; header.ident[1] = 'E'; header.ident[2] = 'L'; header.ident[3] = 'F';
+        header.ident[4] = 1u; header.ident[5] = 1u; header.ident[6] = 1u;
+        header.type = 2u; header.machine = 8u; header.version = 1u;
+        header.entry = loadAddress; header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader); header.phentsize = sizeof(ProgramHeader); header.phnum = 1u;
+
+        ProgramHeader program{};
+        program.type = 1u; program.offset = codeOffset; program.vaddr = loadAddress; program.paddr = loadAddress;
+        program.filesz = 0x160u; program.memsz = 0x160u; program.flags = 7u; program.align = 4u;
+
+        const uint32_t entry[] = {
+            0x27BDFFE0u, 0xAFBF001Cu,
+            0x3C040001u, 0x34840080u,
+            0x0C000000u | ((loadcoreStubAddress >> 2u) & 0x03FFFFFFu), 0x00000000u,
+            0x8FBF001Cu, 0x00001021u,
+            0x27BD0020u, 0x03E00008u, 0x00000000u,
+        };
+        const uint32_t target[] = {
+            0x24020042u, // addiu $v0, $zero, 0x42
+            0x03E00008u, 0x00000000u,
+        };
+        uint32_t exportTable[5u + 22u] = {
+            0x41C00000u, 0u, 0x00000101u,
+            0x616D6F69u, 0x0000006Eu, // "ioman"
+        };
+        for (uint32_t ordinal = 0u; ordinal <= 20u; ++ordinal)
+            exportTable[5u + ordinal] = targetAddress;
+        exportTable[5u + 21u] = 0u;
+        const uint32_t loadcoreImports[] = {
+            0x41E00000u, 0u, 0x00000101u,
+            0x64616F6Cu, 0x65726F63u, // "loadcore"
+            0x03E00008u, 0x24000006u, 0u, 0u,
+        };
+        const uint32_t iomanImports[] = {
+            0x41E00000u, 0u, 0x00000101u,
+            0x616D6F69u, 0x0000006Eu, // "ioman"
+            0x03E00008u, 0x24000014u, 0u, 0u,
+        };
+
+        std::memset(host.guest.data() + address, 0, codeOffset + program.filesz);
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, entry, sizeof(entry));
+        std::memcpy(host.guest.data() + address + codeOffset + 0x60u, target, sizeof(target));
+        std::memcpy(host.guest.data() + address + codeOffset + 0x80u, exportTable, sizeof(exportTable));
+        std::memcpy(host.guest.data() + address + codeOffset + 0x100u, loadcoreImports, sizeof(loadcoreImports));
+        std::memcpy(host.guest.data() + address + codeOffset + 0x120u, iomanImports, sizeof(iomanImports));
+    }
+
+    void writeGuestIomanConsumerIrx(TestHost &host, uint32_t address)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00011000u;
+        constexpr uint32_t importTableAddress = loadAddress + 0x40u;
+        constexpr uint32_t importStubAddress = importTableAddress + 20u;
+
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu; header.ident[1] = 'E'; header.ident[2] = 'L'; header.ident[3] = 'F';
+        header.ident[4] = 1u; header.ident[5] = 1u; header.ident[6] = 1u;
+        header.type = 2u; header.machine = 8u; header.version = 1u;
+        header.entry = loadAddress; header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader); header.phentsize = sizeof(ProgramHeader); header.phnum = 1u;
+
+        ProgramHeader program{};
+        program.type = 1u; program.offset = codeOffset; program.vaddr = loadAddress; program.paddr = loadAddress;
+        program.filesz = 0x80u; program.memsz = 0x80u; program.flags = 7u; program.align = 4u;
+
+        const uint32_t entry[] = {
+            0x27BDFFF0u, 0xAFBF000Cu,
+            0x24040000u, // a0 = NULL: HLE AddDrv would reject this
+            0x0C000000u | ((importStubAddress >> 2u) & 0x03FFFFFFu), 0x00000000u,
+            0x8FBF000Cu, 0x27BD0010u,
+            0x03E00008u, 0x00000000u,
+        };
+        const uint32_t importTable[] = {
+            0x41E00000u, 0u, 0x00000101u,
+            0x616D6F69u, 0x0000006Eu, // "ioman"
+            0x03E00008u, 0x24000014u, 0u, 0u, // AddDrv, ordinal 20
+        };
+
+        std::memset(host.guest.data() + address, 0, codeOffset + program.filesz);
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, entry, sizeof(entry));
         std::memcpy(host.guest.data() + address + codeOffset + 0x40u, importTable, sizeof(importTable));
     }
 
@@ -619,6 +757,139 @@ namespace
         std::memcpy(segment.data() + 0x100u, imports, sizeof(imports));
         std::memcpy(segment.data() + 0x180u, descriptor, sizeof(descriptor));
         std::memcpy(segment.data() + 0x1A0u, &payload, sizeof(payload));
+        std::memset(host.guest.data() + address, 0, codeOffset + program.filesz);
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
+    }
+
+    void writeIopSif0DmaIrx(TestHost &host, uint32_t address, bool interruptOutput)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00010000u;
+        constexpr uint32_t importTableAddress = loadAddress + 0x100u;
+        constexpr uint32_t registerIntrHandlerStub = importTableAddress + 20u;
+        constexpr uint32_t enableIntrStub = registerIntrHandlerStub + 8u;
+        constexpr uint32_t handlerAddress = loadAddress + 0x160u;
+        constexpr uint32_t markerAddress = loadAddress + 0x1A0u;
+        constexpr uint32_t tagAddress = loadAddress + 0x1B0u;
+        constexpr uint32_t payloadAddress = loadAddress + 0x1D0u;
+        constexpr uint32_t eeDestination = 0xC00u;
+
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu; header.ident[1] = 'E'; header.ident[2] = 'L'; header.ident[3] = 'F';
+        header.ident[4] = 1u; header.ident[5] = 1u; header.ident[6] = 1u;
+        header.type = 2u; header.machine = 8u; header.version = 1u;
+        header.entry = loadAddress; header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader); header.phentsize = sizeof(ProgramHeader); header.phnum = 1u;
+
+        ProgramHeader program{};
+        program.type = 1u; program.offset = codeOffset; program.vaddr = loadAddress; program.paddr = loadAddress;
+        program.filesz = 0x200u; program.memsz = 0x200u; program.flags = 7u; program.align = 4u;
+
+        const auto jal = [](uint32_t target) { return 0x0C000000u | ((target >> 2u) & 0x03FFFFFFu); };
+        const uint32_t entry[] = {
+            0x27BDFFF0u, 0xAFBF000Cu,
+            0x2404002Au,                         // a0 = IOP_IRQ_DMA_SIF0
+            0x24050000u,                         // a1 = mode 0
+            0x3C060001u, 0x34C60160u,            // a2 = handler address
+            0x24070000u,                         // a3 = argument 0
+            jal(registerIntrHandlerStub), 0x00000000u,
+            0x2404022Au,                         // a0 = DMAC2 | IOP_IRQ_DMA_SIF0
+            jal(enableIntrStub), 0x00000000u,
+            0x3C081F80u,                         // t0 = IOP hardware base
+            0x3C090001u, 0x352901B0u,            // t1 = SIF0 TADR (0x000101B0)
+            0xAD09152Cu,                         // sw t1, D9_TADR(t0)
+            0x34090020u,                         // BCR low block size
+            0xAD091524u,                         // sw t1, D9_BCR(t0)
+            0x3C090100u, 0x35290701u,            // D9_CHCR = 0x01000701
+            0xAD091528u,
+            0x8FBF000Cu, 0x27BD0010u, 0x03E00008u, 0x24020000u,
+        };
+        const uint32_t handler[] = {
+            0x3C081F80u, 0x8D091528u,            // read completed D9_CHCR
+            0x3C080001u, 0x350801A0u,            // t0 = marker address
+            0xAD090000u,                         // save CHCR for the assertion
+            0x03E00008u, 0x00000000u,
+        };
+        const uint32_t imports[] = {
+            0x41E00000u, 0u, 0x00000101u,
+            0x72746E69u, 0x006E616Du,            // "intrman"
+            0x03E00008u, 0x24000004u,            // RegisterIntrHandler
+            0x03E00008u, 0x24000006u,            // EnableIntr
+            0u, 0u,
+        };
+        const uint32_t tag[] = {
+            payloadAddress | 0x80000000u,        // last SIF tag, source in IOP RAM
+            1u,                                   // one data word
+            0x10000001u | (interruptOutput ? 0x80000000u : 0u), // chain marker, QWC, INT_O
+            eeDestination,
+        };
+        constexpr uint32_t payload = 0x53494621u; // "SIF!"
+
+        std::vector<uint8_t> segment(program.filesz, 0u);
+        std::memcpy(segment.data(), entry, sizeof(entry));
+        std::memcpy(segment.data() + 0x100u, imports, sizeof(imports));
+        std::memcpy(segment.data() + 0x160u, handler, sizeof(handler));
+        std::memcpy(segment.data() + 0x1B0u, tag, sizeof(tag));
+        std::memcpy(segment.data() + 0x1D0u, &payload, sizeof(payload));
+        std::memset(host.guest.data() + address, 0, codeOffset + program.filesz);
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
+    }
+
+    void writeSif1InterruptIrx(TestHost &host, uint32_t address)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00010000u;
+        constexpr uint32_t importTableAddress = loadAddress + 0x100u;
+        constexpr uint32_t registerIntrHandlerStub = importTableAddress + 20u;
+        constexpr uint32_t enableIntrStub = registerIntrHandlerStub + 8u;
+        constexpr uint32_t handlerAddress = loadAddress + 0x140u;
+        constexpr uint32_t markerAddress = loadAddress + 0x180u;
+
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu; header.ident[1] = 'E'; header.ident[2] = 'L'; header.ident[3] = 'F';
+        header.ident[4] = 1u; header.ident[5] = 1u; header.ident[6] = 1u;
+        header.type = 2u; header.machine = 8u; header.version = 1u;
+        header.entry = loadAddress; header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader); header.phentsize = sizeof(ProgramHeader); header.phnum = 1u;
+
+        ProgramHeader program{};
+        program.type = 1u; program.offset = codeOffset; program.vaddr = loadAddress; program.paddr = loadAddress;
+        program.filesz = 0x200u; program.memsz = 0x200u; program.flags = 7u; program.align = 4u;
+
+        const auto jal = [](uint32_t target) { return 0x0C000000u | ((target >> 2u) & 0x03FFFFFFu); };
+        const uint32_t entry[] = {
+            0x27BDFFF0u, 0xAFBF000Cu, // addiu sp,-16; sw ra,12(sp)
+            0x2404002Bu,             // a0 = IOP_IRQ_DMA_SIF1
+            0x24050000u,             // a1 = mode 0
+            0x3C060001u, 0x34C60140u,// a2 = handler
+            0x24070000u,             // a3 = argument 0
+            jal(registerIntrHandlerStub), 0x00000000u,
+            0x2404022Bu,             // a0 = 0x200 | IOP_IRQ_DMA_SIF1 (DMAC2)
+            jal(enableIntrStub), 0x00000000u,
+            0x8FBF000Cu, 0x27BD0010u, 0x03E00008u, 0x24020000u,
+        };
+        const uint32_t handler[] = {
+            0x3C080001u, 0x35080180u, // t0 = marker address
+            0x24090001u,             // t1 = 1
+            0xAD090000u,             // sw t1,0(t0)
+            0x03E00008u, 0x00000000u,
+        };
+        const uint32_t imports[] = {
+            0x41E00000u, 0u, 0x00000101u,
+            0x72746E69u, 0x006E616Du, // "intrman"
+            0x03E00008u, 0x24000004u, // RegisterIntrHandler
+            0x03E00008u, 0x24000006u, // EnableIntr
+            0u, 0u,
+        };
+
+        std::vector<uint8_t> segment(program.filesz, 0u);
+        std::memcpy(segment.data(), entry, sizeof(entry));
+        std::memcpy(segment.data() + 0x140u, handler, sizeof(handler));
+        std::memcpy(segment.data() + 0x100u, imports, sizeof(imports));
         std::memset(host.guest.data() + address, 0, codeOffset + program.filesz);
         std::memcpy(host.guest.data() + address, &header, sizeof(header));
         std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
@@ -914,6 +1185,14 @@ int main()
     sifMemory.write32(0x1D000030u, 0x00020000u);
     if (!expect(sifMemory.readSifRegister(4u, sifFlag) && sifFlag == 0x00030000u,
                 "IOP SMFLAG writes must preserve previously published bits")) return 1;
+    if (!expect(sifMemory.writeSifRegisterFromIop(4u, 0x00040000u),
+                "IOP-side SMFLAG publication failed")) return 1;
+    if (!expect(sifMemory.readSifRegister(4u, sifFlag) && sifFlag == 0x00070000u,
+                "IOP-side SMFLAG publication must preserve earlier bits")) return 1;
+    if (!expect(sifMemory.writeSifRegisterFromIop(3u, 0x00020000u),
+                "IOP-side MSFLAG acknowledgement failed")) return 1;
+    if (!expect(sifMemory.readSifRegister(3u, sifFlag) && sifFlag == 0u,
+                "IOP-side MSFLAG acknowledgement must clear selected bits")) return 1;
 
     if (!expect(sifMemory.writeSifRegisterFromEe(3u, 0x00030000u),
                 "EE MSFLAG write failed")) return 1;
@@ -923,11 +1202,56 @@ int main()
 
     if (!expect(sifMemory.writeSifRegisterFromEe(4u, 0x00020000u),
                 "EE SMFLAG write failed")) return 1;
-    if (!expect(sifMemory.readSifRegister(4u, sifFlag) && sifFlag == 0x00010000u,
+    if (!expect(sifMemory.readSifRegister(4u, sifFlag) && sifFlag == 0x00050000u,
                 "EE SMFLAG write must clear acknowledged bits")) return 1;
 
     TestHost host(0x20000u);
     IopSubsystem iop(host);
+
+    const auto hostCdvdSuffix = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::filesystem::path hostCdRoot = std::filesystem::temp_directory_path() /
+        ("ps2x-iop-host-cdvd-" + std::to_string(hostCdvdSuffix));
+    std::error_code hostCdError;
+    std::filesystem::create_directory(hostCdRoot, hostCdError);
+    if (!expect(!hostCdError, "Could not create host-CDVD provider test root")) return 1;
+    host.cdRoot = hostCdRoot.string();
+    const ModuleLoadResult hostCdvdman = iop.loadModuleScheduled("rom0:CDVDMAN");
+    if (!expect(hostCdvdman.handled && hostCdvdman.moduleId > 0 &&
+                    hostCdvdman.startResult == 0 && !hostCdvdman.startPending,
+                "ROM0 CDVDMAN host implementation did not register as a completed HLE load")) return 1;
+    if (!expect(iop.prepareCdvdDeviceState(),
+                "host CDVDMAN did not prepare the configured extracted-CD media root")) return 1;
+    iop.reset();
+    host.cdRoot.clear();
+    std::filesystem::remove_all(hostCdRoot, hostCdError);
+    if (!expect(!hostCdError, "Could not remove host-CDVD provider test root")) return 1;
+
+    // PCSX2's R3000A reset exposes the PS2 IOP PRid (0x1F) and BEV state.
+    // Read PRid through real MFC0 instructions, including its load delay.
+    writeMinimalIrx(host, 0x100u);
+    const uint32_t readPrid[] = {
+        0x40087800u, // mfc0 t0, $15 (PRid)
+        0x00000000u, // nop (R3000 load delay)
+        0x25020000u, // addiu v0, t0, 0
+        0x03E00008u, // jr ra
+        0x00000000u, // nop
+    };
+    std::memcpy(host.guest.data() + 0x200u, readPrid, sizeof(readPrid));
+    const ModuleLoadResult pridResult = iop.loadModuleBuffer(0x100u);
+    if (!expect(pridResult.handled && pridResult.startResult == 0x1F,
+                "IOP reset did not expose the PS2 R3000A PRid")) return 1;
+    iop.reset();
+
+    // An entry that never returns must not be accepted as module initialization.
+    writeMinimalIrx(host, 0x100u);
+    const uint32_t spin[] = {0x08004000u, 0u}; // j 0x10000; nop
+    std::memcpy(host.guest.data() + 0x200u, spin, sizeof(spin));
+    const ModuleLoadResult exhausted = iop.loadModuleBuffer(0x100u);
+    if (!expect(exhausted.handled && exhausted.moduleId < 0 && exhausted.startResult < 0,
+                "Instruction-budget exhaustion was reported as module initialization")) return 1;
+    if (!expect(iop.debugSnapshot().emulatorLoadedModules == 0u,
+                "Failed initialization published a module")) return 1;
+    iop.reset();
 
     writeMinimalIrx(host, 0x100u);
     const ModuleLoadResult result = iop.loadModuleBuffer(0x100u);
@@ -1013,13 +1337,92 @@ int main()
 
     iop.reset();
     writeExportProviderIrx(host, 0x100u);
-    const ModuleLoadResult exportProvider = iop.loadModuleBuffer(0x100u);
-    if (!expect(exportProvider.handled && exportProvider.startResult == 0,
-                "Synthetic export provider did not register")) return 1;
+    const ModuleLoadResult exportProvider = iop.loadModuleBufferScheduled(0x100u);
+    if (!expect(exportProvider.handled && exportProvider.moduleId > 0 && exportProvider.startPending,
+                "Synthetic export provider module_start was not scheduled")) return 1;
+    const IopModuleStartState exportProviderBeforeRun = iop.moduleStartState(exportProvider.moduleId);
+    if (!expect(exportProviderBeforeRun.found && exportProviderBeforeRun.pending,
+                "Scheduled module_start did not expose a pending state")) return 1;
+    iop.runEeCycles(8u * 128u);
+    const IopModuleStartState exportProviderAfterRun = iop.moduleStartState(exportProvider.moduleId);
+    if (!expect(exportProviderAfterRun.found && !exportProviderAfterRun.pending &&
+                    exportProviderAfterRun.returned && exportProviderAfterRun.startResult == 0,
+                "IOP module_start did not run to completion on EE-accounted IOP cycles")) return 1;
     writeExportConsumerIrx(host, 0x500u);
     const ModuleLoadResult exportConsumer = iop.loadModuleBuffer(0x500u);
     if (!expect(exportConsumer.handled && exportConsumer.startResult == 0x42,
                 "IRX export ordinal was shifted by implicit function slots")) return 1;
+
+    iop.reset();
+    writeGuestIomanProviderIrx(host, 0x100u);
+    const ModuleLoadResult guestIomanProvider = iop.loadModuleBuffer(0x100u);
+    if (!expect(guestIomanProvider.handled && guestIomanProvider.startResult == 0,
+                "Synthetic guest IOMAN provider did not register its exports")) return 1;
+    writeGuestIomanConsumerIrx(host, 0x500u);
+    const ModuleLoadResult guestIomanConsumer = iop.loadModuleBuffer(0x500u);
+    if (!expect(guestIomanConsumer.handled && guestIomanConsumer.startResult == 0x42,
+                "IOMAN AddDrv import did not prefer the loaded guest implementation")) return 1;
+
+    iop.reset();
+    writeExportProviderIrx(host, 0x100u);
+    const std::vector<uint8_t> exportProviderImage(host.guest.begin() + 0x100u,
+                                                    host.guest.begin() + 0x2F0u);
+    host.file = makeRomDirImage(exportProviderImage);
+    const ModuleLoadResult scheduledProvider =
+        iop.loadRomDirModuleScheduled("cdrom0:/modules/dnas310.img", "TEST");
+    if (!expect(scheduledProvider.handled && scheduledProvider.startPending,
+                "Scheduled export provider did not queue module_start")) return 1;
+    iop.runEeCycles(8u * 128u);
+    const IopModuleStartState scheduledProviderState = iop.moduleStartState(scheduledProvider.moduleId);
+    if (!expect(scheduledProviderState.found && !scheduledProviderState.pending &&
+                    scheduledProviderState.returned,
+                "Scheduled export provider did not finish before its export was called")) return 1;
+    iop.reset();
+    writeExportProviderIrx(host, 0x100u);
+    host.file.assign(host.guest.begin() + 0x100u, host.guest.begin() + 0x2F0u);
+    const ModuleLoadResult scheduledFileProvider =
+        iop.loadModuleScheduled("cdrom0:/modules/test_provider.irx");
+    if (!expect(scheduledFileProvider.handled && scheduledFileProvider.moduleId > 0 &&
+                    scheduledFileProvider.startPending,
+                "IopSubsystem did not schedule a physical module loaded from a host file")) return 1;
+    iop.runEeCycles(8u * 128u);
+    const IopModuleStartState scheduledFileProviderState =
+        iop.moduleStartState(scheduledFileProvider.moduleId);
+    if (!expect(scheduledFileProviderState.found && !scheduledFileProviderState.pending &&
+                    scheduledFileProviderState.returned && scheduledFileProviderState.startResult == 0,
+                "Scheduled host-file module_start did not complete under the IOP subsystem")) return 1;
+    const uint32_t sifPollLoop[] = {
+        0x3C081D00u, // lui $t0, 0x1d00: IOP SIF MMIO base
+        0x8D020020u, // lw $v0, 0x20($t0): MSFLAG / SIF register 3
+        0x3C090001u, // lui $t1, 1: CMDINIT mask
+        0x00491024u, // and $v0, $v0, $t1
+        0x1040FFFCu, // beq $v0, $zero, back to the MMIO read
+        0x00000000u, // branch delay slot
+        0x03E00008u, // jr $ra
+        0x24020001u, // return value in the jump delay slot
+    };
+    if (!expect(iop.writeMemory(0x10060u, sifPollLoop, sizeof(sifPollLoop)),
+                "Could not install the controlled SIF polling fixture")) return 1;
+    const IopScheduledCall scheduledPoll = iop.scheduleExportCall("tstlib", 3u);
+    if (!expect(scheduledPoll.found && scheduledPoll.entry == 0x10060u,
+                "SIF polling export was not scheduled as an IOP thread")) return 1;
+    iop.runEeCycles(8u * 128u);
+    const IopScheduledCallState waitingPoll = iop.scheduledCallState(scheduledPoll.id);
+    uint32_t smflag = 0u;
+    if (!expect(waitingPoll.found && !waitingPoll.finished && !waitingPoll.returned &&
+                    waitingPoll.instructions > 0u,
+                "IOP polling call did not yield back to the EE cycle scheduler")) return 1;
+    if (!expect(iop.readSifRegister(3u, smflag) && smflag == 0u,
+                "Unseeded SIF fixture unexpectedly exposed a ready flag")) return 1;
+    if (!expect(iop.writeSifRegisterFromEe(3u, 0x00010000u),
+                "Fixture EE could not publish the observed MSFLAG event")) return 1;
+    iop.runEeCycles(8u * 32u);
+    const IopScheduledCallState returnedPoll = iop.scheduledCallState(scheduledPoll.id);
+    if (!expect(returnedPoll.found && returnedPoll.finished && returnedPoll.returned &&
+                    returnedPoll.value == 1u && returnedPoll.instructions > waitingPoll.instructions,
+                "IOP polling function did not resume and return after the EE SIF write")) return 1;
+    if (!expect(iop.releaseScheduledCall(scheduledPoll.id),
+                "Completed scheduled IOP call could not release its thread and stack")) return 1;
 
     iop.reset();
     constexpr uint32_t eeSource = 0x100u;
@@ -1054,6 +1457,50 @@ int main()
                 "SIF notification corrupted physical IOP memory")) return 1;
 
     iop.reset();
+    writeSif1InterruptIrx(host, 0x100u);
+    const ModuleLoadResult sif1InterruptModule = iop.loadModuleBuffer(0x100u);
+    uint32_t sif1InterruptMarker = 0u;
+    if (!expect(sif1InterruptModule.handled && sif1InterruptModule.startResult == 0,
+                "SIF1 interrupt fixture did not register its guest handler")) return 1;
+    if (!expect(iop.readMemory(0x10180u, &sif1InterruptMarker, sizeof(sif1InterruptMarker)) &&
+                    sif1InterruptMarker == 0u,
+                "SIF1 fixture marker was not initially clear")) return 1;
+
+    iop.onSifTransfer({
+        SifTransferKind::GetOtherData,
+        SifTransferPhase::AfterCopy,
+        0x100u,
+        0x200u,
+        sizeof(uint32_t),
+    });
+    iop.onSifTransfer({
+        SifTransferKind::SetDma,
+        SifTransferPhase::BeforeCopy,
+        0x100u,
+        0x200u,
+        sizeof(uint32_t),
+    });
+    iop.runEeCycles(8u);
+    if (!expect(iop.readMemory(0x10180u, &sif1InterruptMarker, sizeof(sif1InterruptMarker)) &&
+                    sif1InterruptMarker == 0u,
+                "SIF1 interrupt fired before an EE-to-IOP transfer completed")) return 1;
+
+    iop.onSifTransfer({
+        SifTransferKind::SetDma,
+        SifTransferPhase::AfterCopy,
+        0x100u,
+        0x200u,
+        sizeof(uint32_t),
+    });
+    if (!expect(iop.readMemory(0x10180u, &sif1InterruptMarker, sizeof(sif1InterruptMarker)) &&
+                    sif1InterruptMarker == 0u,
+                "SIF1 interrupt ran synchronously before IOP scheduler progress")) return 1;
+    iop.runEeCycles(8u);
+    if (!expect(iop.readMemory(0x10180u, &sif1InterruptMarker, sizeof(sif1InterruptMarker)) &&
+                    sif1InterruptMarker == 1u,
+                "Completed EE-to-IOP SIF DMA did not dispatch the registered SIF1 handler")) return 1;
+
+    iop.reset();
     constexpr uint32_t sifDmaDestination = 0xC00u;
     writeSifDmaIrx(host, 0x100u);
     const ModuleLoadResult sifDmaModule = iop.loadModuleBuffer(0x100u);
@@ -1078,6 +1525,63 @@ int main()
                 "SIF_DMA_INT_O did not notify the EE SIF0 completion path exactly once")) return 1;
     if (!expect(host.sif0PayloadVisibleAtNotification,
                 "EE SIF0 completion was notified before the DMA payload reached guest memory")) return 1;
+
+    iop.reset();
+    host.sif0Notifications = 0u;
+    host.sif0PayloadVisibleAtNotification = false;
+    std::memset(host.guest.data() + 0xC00u, 0, sizeof(uint32_t));
+    writeIopSif0DmaIrx(host, 0x100u, true);
+    const ModuleLoadResult guestSif0DmaModule = iop.loadModuleBuffer(0x100u);
+    uint32_t guestSif0Payload = 0u;
+    uint32_t guestSif0IrqMarker = 0u;
+    std::memcpy(&guestSif0Payload, host.guest.data() + 0xC00u, sizeof(guestSif0Payload));
+    if (!expect(guestSif0DmaModule.handled && guestSif0DmaModule.startResult == 0,
+                "Guest-programmed IOP channel-9 SIF0 DMA fixture did not return")) return 1;
+    if (guestSif0Payload != 0x53494621u)
+    {
+        for (const std::string &message : host.logs)
+            std::cerr << "IOP test host log: " << message << std::endl;
+        if (!expect(false,
+                    "Guest-programmed IOP SIF0 chain did not copy its padded payload to EE RAM")) return 1;
+    }
+    if (!expect(host.sif0Notifications == 1u && host.sif0PayloadVisibleAtNotification,
+                "Guest IOP SIF0 INT_O did not notify EE after the payload became visible")) return 1;
+    if (!iop.readMemory(0x101A0u, &guestSif0IrqMarker, sizeof(guestSif0IrqMarker)))
+        return expect(false, "Could not read the IOP SIF0 completion marker");
+    if (!expect(guestSif0IrqMarker == 0u,
+                "IOP SIF0 completion IRQ ran synchronously before its scheduled completion cycle")) return 1;
+    iop.runEeCycles(512u); // The IOP scheduler advances at one cycle per eight EE cycles.
+    if (!iop.readMemory(0x101A0u, &guestSif0IrqMarker, sizeof(guestSif0IrqMarker)))
+        return expect(false, "Could not read the IOP SIF0 completion marker after IRQ dispatch");
+    if (guestSif0IrqMarker != 0x00000701u)
+    {
+        std::cerr << "IOP SIF0 IRQ marker value=0x" << std::hex << guestSif0IrqMarker << std::dec << std::endl;
+        for (const std::string &message : host.logs)
+            std::cerr << "IOP test host log: " << message << std::endl;
+        if (!expect(false,
+                    "IOP SIF0 completion did not clear CHCR busy before dispatching IRQ 0x2A")) return 1;
+    }
+
+    iop.reset();
+    host.sif0Notifications = 0u;
+    host.sif0PayloadVisibleAtNotification = false;
+    std::memset(host.guest.data() + 0xC00u, 0, sizeof(uint32_t));
+    const uint32_t zeroMarker = 0u;
+    if (!iop.writeMemory(0x101A0u, &zeroMarker, sizeof(zeroMarker)))
+        return expect(false, "Could not clear the IOP SIF0 completion marker");
+    writeIopSif0DmaIrx(host, 0x100u, false);
+    const ModuleLoadResult guestSif0NoInterruptModule = iop.loadModuleBuffer(0x100u);
+    std::memcpy(&guestSif0Payload, host.guest.data() + 0xC00u, sizeof(guestSif0Payload));
+    if (!expect(guestSif0NoInterruptModule.handled && guestSif0NoInterruptModule.startResult == 0 &&
+                    guestSif0Payload == 0x53494621u,
+                "Guest IOP SIF0 transfer without INT_O did not copy data")) return 1;
+    if (!expect(host.sif0Notifications == 0u,
+                "Guest IOP SIF0 transfer without INT_O incorrectly notified the EE")) return 1;
+    iop.runEeCycles(512u);
+    if (!iop.readMemory(0x101A0u, &guestSif0IrqMarker, sizeof(guestSif0IrqMarker)))
+        return expect(false, "Could not read the IOP SIF0 no-interrupt marker");
+    if (!expect(guestSif0IrqMarker == 0u,
+                "Guest IOP SIF0 transfer without INT_O incorrectly raised IRQ 0x2A")) return 1;
 
     iop.reset();
     writeVblankSchedulingIrx(host, 0x100u);

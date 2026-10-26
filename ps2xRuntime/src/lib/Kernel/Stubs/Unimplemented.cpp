@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "Unimplemented.h"
+#include "runtime/ee_scheduler.h"
 
 namespace ps2_stubs
 {
@@ -11,6 +12,8 @@ namespace ps2_stubs
     void TODO_NAMED(const char *name, uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const std::string stubName = name ? name : "unknown";
+        if (runtime && runtime->diagnosticUnsupportedStub(ctx, name))
+            throw EeDispatcherTransfer{};
 
         uint32_t callCount = 0;
         {

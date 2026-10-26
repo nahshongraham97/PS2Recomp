@@ -5,6 +5,8 @@
 #include "../services/iop_rpc.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <iostream>
 
 namespace ps2x::iop::detail
 {
@@ -47,6 +49,10 @@ namespace ps2x::iop::detail
             }
 
             m_devices.push_back({a0, cpu.gpr[28], name});
+            if (std::getenv("PS2X_IOP_IOMAN_TRACE") != nullptr)
+                std::cerr << "[IOP_IOMAN_ADDDRV] name='" << name << "' address=0x"
+                          << std::hex << a0 << " operations=0x" << operations
+                          << std::dec << " count=" << m_devices.size() << '\n';
             const uint32_t init = m_memory.read32(operations);
             if (init != 0u)
             {
@@ -81,6 +87,9 @@ namespace ps2x::iop::detail
             if (deinit != 0u)
                 (void)executor.executeGuestFunction(deinit, device->address, 0u, 0u, 0u, device->gp);
             m_devices.erase(device);
+            if (std::getenv("PS2X_IOP_IOMAN_TRACE") != nullptr)
+                std::cerr << "[IOP_IOMAN_DELDRV] name='" << name << "' count="
+                          << m_devices.size() << '\n';
             setV0(0u);
             return true;
         }

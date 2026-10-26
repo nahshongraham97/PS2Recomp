@@ -4,11 +4,18 @@
 #include "../iop_emulator_const.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <iostream>
 
 namespace ps2x::iop::detail
 {
     namespace
     {
+        // The retained Armageddon DNAS310 capture stores this IOP system
+        // event ID in SIFCMD's m_ef global. Keep the value here as an opaque
+        // kernel handle; its event bits are still driven by the guest path.
+        constexpr int kCapturedSystemStatusEventFlagId = 0x00264303;
+
         uint32_t alignUp(uint32_t value, uint32_t alignment)
         {
             if (alignment <= 1u)
@@ -31,6 +38,14 @@ namespace ps2x::iop::detail
         m_nextThreadId = 1;
         m_nextSemaphoreId = 1;
         m_nextEventFlagId = 1;
+        // The IOP kernel owns a system event flag from reset onward. The
+        // captured ID is opaque to guest code; its bit set starts empty here
+        // so only the original guest SIF command handler can publish 0x100.
+        EventFlag systemStatusFlag;
+        systemStatusFlag.id = kCapturedSystemStatusEventFlagId;
+        systemStatusFlag.bits = 0u;
+        m_systemStatusEventFlagId = systemStatusFlag.id;
+        m_eventFlags.emplace(m_systemStatusEventFlagId, systemStatusFlag);
         m_currentThread = nullptr;
     }
 
@@ -293,8 +308,15 @@ namespace ps2x::iop::detail
             return true;
         }
         case 41:
-            setV0(0);
+        {
+            const auto statusFlag = m_eventFlags.find(m_systemStatusEventFlagId);
+            const int32_t eventId = statusFlag == m_eventFlags.end() ? -1 : statusFlag->first;
+            if (std::getenv("PS2X_SIF_TRACE_DATA") != nullptr)
+                std::cerr << "[IOP_SYSTEM_EVENT_GET] ordinal=41 id=0x" << std::hex
+                          << static_cast<uint32_t>(eventId) << std::dec << std::endl;
+            setV0(eventId);
             return true;
+        }
         default:
             return false;
         }
@@ -564,7 +586,17 @@ namespace ps2x::iop::detail
         case 6:
         case 7:
         {
-            if (!setInternalEventFlag(static_cast<int>(cpu.gpr[4]), cpu.gpr[5]))
+            const int eventId = static_cast<int>(cpu.gpr[4]);
+            const bool set = setInternalEventFlag(eventId, cpu.gpr[5]);
+            if (eventId == m_systemStatusEventFlagId && std::getenv("PS2X_SIF_TRACE_DATA") != nullptr)
+            {
+                const auto event = m_eventFlags.find(eventId);
+                std::cerr << "[IOP_SYSTEM_EVENT_SET] id=0x" << std::hex << eventId
+                          << " mask=0x" << cpu.gpr[5]
+                          << " bits=0x" << (event != m_eventFlags.end() ? event->second.bits : 0u)
+                          << std::dec << " success=" << (set ? "true" : "false") << std::endl;
+            }
+            if (!set)
             {
                 setV0(-1);
                 return true;
@@ -589,15 +621,26 @@ namespace ps2x::iop::detail
         case 10: // WaitEventFlag
         case 11: // PollEventFlag
         {
-            const auto event = m_eventFlags.find(static_cast<int>(cpu.gpr[4]));
+            const int eventId = static_cast<int>(cpu.gpr[4]);
+            const auto event = m_eventFlags.find(eventId);
             if (event == m_eventFlags.end())
             {
+                if (eventId == m_systemStatusEventFlagId && std::getenv("PS2X_SIF_TRACE_DATA") != nullptr)
+                    std::cerr << "[IOP_SYSTEM_EVENT_WAIT] id=0x" << std::hex << eventId
+                              << " missing=true" << std::dec << std::endl;
                 setV0(-1);
                 return true;
             }
             const uint32_t bits = cpu.gpr[5];
             const uint32_t mode = cpu.gpr[6];
-            if (eventSatisfied(event->second, bits, mode))
+            const bool satisfied = eventSatisfied(event->second, bits, mode);
+            if (eventId == m_systemStatusEventFlagId && std::getenv("PS2X_SIF_TRACE_DATA") != nullptr)
+                std::cerr << "[IOP_SYSTEM_EVENT_WAIT] id=0x" << std::hex << eventId
+                          << " bits=0x" << event->second.bits << " requested=0x" << bits
+                          << " mode=0x" << mode << std::dec
+                          << " satisfied=" << (satisfied ? "true" : "false")
+                          << " poll=" << (ordinal == 11u ? "true" : "false") << std::endl;
+            if (satisfied)
             {
                 if (cpu.gpr[7] != 0u)
                     m_memory.write32(cpu.gpr[7], event->second.bits);
@@ -694,6 +737,54 @@ namespace ps2x::iop::detail
         next->cpu.stopped = false;
         next->cpu.yielded = false;
         return next;
+    }
+
+    int IopKernel::scheduleFunction(uint32_t entry, uint32_t a0, uint32_t a1,
+                                    uint32_t a2, uint32_t a3, uint32_t gp)
+    {
+        IopThread thread;
+        thread.id = static_cast<int>(m_nextThreadId++);
+        thread.entry = entry;
+        thread.stackSize = 0x4000u;
+        thread.stackBase = m_memory.allocate(thread.stackSize + kStackGuardBytes, 16u);
+        if (thread.stackBase == 0u)
+            return -1;
+
+        thread.cpu.pc = entry;
+        thread.cpu.gpr[4] = a0;
+        thread.cpu.gpr[5] = a1;
+        thread.cpu.gpr[6] = a2;
+        thread.cpu.gpr[7] = a3;
+        thread.cpu.gpr[28] = gp;
+        thread.cpu.gpr[29] = alignUp(thread.stackBase + thread.stackSize, 16u) - 16u;
+        thread.cpu.gpr[31] = kThreadReturnSentinel;
+        thread.state = IopThreadState::Ready;
+        const int id = thread.id;
+        m_threads.emplace(id, std::move(thread));
+        return id;
+    }
+
+    IopThread *IopKernel::findThread(int id) noexcept
+    {
+        const auto it = m_threads.find(id);
+        return it == m_threads.end() ? nullptr : &it->second;
+    }
+
+    const IopThread *IopKernel::findThread(int id) const noexcept
+    {
+        const auto it = m_threads.find(id);
+        return it == m_threads.end() ? nullptr : &it->second;
+    }
+
+    bool IopKernel::releaseThread(int id)
+    {
+        const auto it = m_threads.find(id);
+        if (it == m_threads.end() || it->second.state == IopThreadState::Running)
+            return false;
+        if (it->second.stackBase != 0u && !m_memory.freeAllocation(it->second.stackBase))
+            return false;
+        m_threads.erase(it);
+        return true;
     }
 
     uint64_t IopKernel::nextWakeCycle(uint64_t fallback) const

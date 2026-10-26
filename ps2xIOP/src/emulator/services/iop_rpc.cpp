@@ -7,8 +7,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <limits>
+#include <sstream>
 #include <vector>
 
 namespace ps2x::iop::detail
@@ -113,6 +116,16 @@ namespace ps2x::iop::detail
                     setV0(0u);
                     return true;
                 }
+                if (std::getenv("PS2X_SIF_TRACE_DATA") != nullptr)
+                {
+                    std::ostringstream out;
+                    out << "[IOP_SIF0_DMA] index=" << i
+                        << " source=0x" << std::hex << transfer.source
+                        << " destination=0x" << transfer.destination
+                        << " size=0x" << transfer.size
+                        << " attr=0x" << transfer.attributes << std::dec;
+                    std::cerr << out.str() << std::endl;
+                }
             }
 
             // PS2SDK's SIF_DMA_INT_O (0x4) becomes the SIF tag's output
@@ -122,6 +135,8 @@ namespace ps2x::iop::detail
             {
                 if ((pending[i].attributes & kSifDmaInterruptOutput) != 0u)
                 {
+                    if (std::getenv("PS2X_SIF_TRACE_DATA") != nullptr)
+                        std::cerr << "[IOP_SIF0_DMA_IRQ] index=" << i << " cause=EE_DMAC_SIF0" << std::endl;
                     m_host.notifyEeSif0DmaComplete();
                 }
             }

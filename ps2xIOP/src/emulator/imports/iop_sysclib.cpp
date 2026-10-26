@@ -8,6 +8,8 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <cstdlib>
+#include <iostream>
 
 namespace ps2x::iop::detail
 {
@@ -21,6 +23,7 @@ namespace ps2x::iop::detail
         const uint32_t a0 = cpu.gpr[4];
         const uint32_t a1 = cpu.gpr[5];
         const uint32_t a2 = cpu.gpr[6];
+        const bool traceStringCalls = std::getenv("PS2X_IOP_SYSCLIB_TRACE") != nullptr;
         const auto setV0 = [&](uint32_t value)
         {
             cpu.gpr[2] = value;
@@ -74,7 +77,36 @@ namespace ps2x::iop::detail
             setV0(static_cast<uint32_t>(std::tolower(static_cast<unsigned char>(a0))));
             return true;
         case 8:
-        case 9: // ctype table is optional for most IRXs.
+        {
+            // sysclib ordinal 8 is look_ctype_table. Its flags are the values
+            // declared by the PS2 IOP ctype API: _U=1, _L=2, _N=4, _S=8,
+            // _P=0x10, _C=0x20, _X=0x40, and _B=0x80.
+            const uint32_t character = a0 & 0xFFu;
+            uint32_t flags = 0u;
+            if (character >= 'A' && character <= 'Z')
+                flags |= 0x01u;
+            if (character >= 'a' && character <= 'z')
+                flags |= 0x02u;
+            if (character >= '0' && character <= '9')
+                flags |= 0x04u;
+            if (character == ' ' || (character >= '\t' && character <= '\r'))
+                flags |= 0x08u;
+            if ((character >= '!' && character <= '/') ||
+                (character >= ':' && character <= '@') ||
+                (character >= '[' && character <= '`') ||
+                (character >= '{' && character <= '~'))
+                flags |= 0x10u;
+            if (character < 0x20u || character == 0x7Fu)
+                flags |= 0x20u;
+            if ((character >= 'A' && character <= 'F') ||
+                (character >= 'a' && character <= 'f'))
+                flags |= 0x40u;
+            if (character == ' ')
+                flags |= 0x80u;
+            setV0(flags);
+            return true;
+        }
+        case 9: // get_ctype_table needs guest table storage; leave unsupported here.
             setV0(0);
             return true;
         case 10: // memchr
@@ -149,29 +181,56 @@ namespace ps2x::iop::detail
                 if (character == needle)
                 {
                     setV0(a0 + i);
+                    if (traceStringCalls)
+                        std::cerr << "[IOP_SYSCLIB_INDEX] ordinal=" << ordinal
+                                  << " ra=0x" << std::hex << cpu.gpr[31]
+                                  << " string=0x" << a0 << " text='" << m_memory.readString(a0, 128u)
+                                  << "' needle=0x" << static_cast<uint32_t>(needle)
+                                  << " result=0x" << (a0 + i) << std::dec << '\n';
                     return true;
                 }
                 if (character == 0u)
                     break;
             }
             setV0(0);
+            if (traceStringCalls)
+                std::cerr << "[IOP_SYSCLIB_INDEX] ordinal=" << ordinal
+                          << " ra=0x" << std::hex << cpu.gpr[31]
+                          << " string=0x" << a0 << " text='" << m_memory.readString(a0, 128u)
+                          << "' needle=0x" << static_cast<uint32_t>(needle)
+                          << " result=0" << std::dec << '\n';
             return true;
         }
         case 22: // strcmp
+        {
+            const bool traceCompare = traceStringCalls;
+            if (traceCompare)
+                std::cerr << "[IOP_SYSCLIB_STRCMP] lhs=0x" << std::hex << a0
+                          << " rhs=0x" << a1
+                          << " lhs_text='" << m_memory.readString(a0, 64u)
+                          << "' rhs_text='" << m_memory.readString(a1, 64u) << "'\n";
             for (uint32_t i = 0; i < (1u << 20); ++i)
             {
                 const uint8_t left = m_memory.read8(a0 + i);
                 const uint8_t right = m_memory.read8(a1 + i);
                 if (left != right)
                 {
-                    setV0(static_cast<uint32_t>(static_cast<int32_t>(left) - static_cast<int32_t>(right)));
+                    const uint32_t result = static_cast<uint32_t>(static_cast<int32_t>(left) - static_cast<int32_t>(right));
+                    setV0(result);
+                    if (traceCompare)
+                        std::cerr << "[IOP_SYSCLIB_STRCMP_RESULT] result=0x" << std::hex << result
+                                  << " left=0x" << static_cast<uint32_t>(left)
+                                  << " right=0x" << static_cast<uint32_t>(right) << std::dec << '\n';
                     return true;
                 }
                 if (left == 0u)
                     break;
             }
             setV0(0);
+            if (traceCompare)
+                std::cerr << "[IOP_SYSCLIB_STRCMP_RESULT] result=0\n";
             return true;
+        }
         case 23: // strcpy
         {
             uint32_t i = 0;
@@ -238,6 +297,10 @@ namespace ps2x::iop::detail
             return true;
         case 30: // strncpy
         {
+            if (traceStringCalls)
+                std::cerr << "[IOP_SYSCLIB_STRNCPY] ra=0x" << std::hex << cpu.gpr[31]
+                          << " dst=0x" << a0 << " src=0x" << a1 << " n=0x" << a2
+                          << " src_text='" << m_memory.readString(a1, 128u) << "'\n";
             bool ended = false;
             for (uint32_t i = 0; i < a2; ++i)
             {
@@ -247,6 +310,9 @@ namespace ps2x::iop::detail
                 m_memory.write8(a0 + i, character);
             }
             setV0(a0);
+            if (traceStringCalls)
+                std::cerr << "[IOP_SYSCLIB_STRNCPY_RESULT] dst=0x" << std::hex << a0
+                          << " text='" << m_memory.readString(a0, 128u) << "'" << std::dec << '\n';
             return true;
         }
         case 31: // strpbrk
@@ -311,6 +377,12 @@ namespace ps2x::iop::detail
                 m_memory.write32(a1, a0 + static_cast<uint32_t>(end - value.c_str()));
             }
             setV0(static_cast<uint32_t>(parsed));
+            if (traceStringCalls)
+                std::cerr << "[IOP_SYSCLIB_STRTOL] ordinal=" << ordinal
+                          << " ra=0x" << std::hex << cpu.gpr[31]
+                          << " text='" << value << "' base=" << std::dec << base
+                          << " parsed=" << parsed << " end=0x" << std::hex
+                          << (a0 + static_cast<uint32_t>(end - value.c_str())) << '\n';
             return true;
         }
         case 37: // atob

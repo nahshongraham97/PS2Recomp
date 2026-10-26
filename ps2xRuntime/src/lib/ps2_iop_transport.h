@@ -5,6 +5,8 @@
 
 #include <utility>
 
+void runPendingArmageddonHostReboot(PS2Runtime *runtime);
+
 class PS2IopTransport
 {
 public:
@@ -66,7 +68,18 @@ public:
         uint32_t index,
         uint32_t value)
     {
-        return runtime && runtime->m_iopSubsystem &&
-               runtime->m_iopSubsystem->writeSifRegisterFromEe(index, value);
+        if (!runtime || !runtime->m_iopSubsystem ||
+            !runtime->m_iopSubsystem->writeSifRegisterFromEe(index, value))
+        {
+            return false;
+        }
+        // Armageddon's original reset routine acknowledges BOOTEND, SIFINIT,
+        // then CMDINIT. Run the explicitly selected host reboot only after the
+        // final guest acknowledgement has cleared its pre-reset flags.
+        if (index == 4u && value == 0x00020000u)
+        {
+            runPendingArmageddonHostReboot(runtime);
+        }
+        return true;
     }
 };

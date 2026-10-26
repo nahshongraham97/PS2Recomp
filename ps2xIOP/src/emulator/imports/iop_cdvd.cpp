@@ -9,9 +9,11 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <system_error>
 #include <unordered_map>
@@ -25,7 +27,7 @@ namespace ps2x::iop::detail
         constexpr uint32_t kSectorSize = 2048u;
         constexpr uint32_t kPrimaryVolumeDescriptorLsn = 16u;
         constexpr uint32_t kVolumeDescriptorTerminatorLsn = 17u;
-        constexpr uint32_t kFirstDirectoryLsn = 20u;
+        constexpr uint32_t kFirstPathTableLsn = 18u;
         constexpr uint32_t kCdvdErrorNone = 0u;
         constexpr uint32_t kCdvdErrorRead = 0x30u;
         constexpr uint32_t kCdvdTypePs2Dvd = 0x14u;
@@ -39,6 +41,11 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCdvdStreamTimeout = 5000u;
         constexpr uint32_t kCdvdSyncTimeout = 15000u;
         constexpr uint32_t kCdvdmanVersion = 0x0226u;
+        constexpr uint8_t kCdvdNCommandNop = 0x00u;
+        constexpr uint8_t kCdvdNCommandNopSync = 0x01u;
+        constexpr uint8_t kCdvdNCommandReadCd = 0x06u;
+        constexpr uint8_t kCdvdSCommandUpdateStickyFlags = 0x05u;
+        constexpr uint32_t kCdvdDmaStart = 1u << 24u;
 
         uint32_t alignSectors(uint64_t bytes)
         {
@@ -61,6 +68,14 @@ namespace ps2x::iop::detail
         {
             for (uint32_t i = 0u; i < 4u; ++i)
                 destination[i] = static_cast<uint8_t>(value >> (i * 8u));
+        }
+
+        uint32_t readLe32(const uint8_t *source)
+        {
+            return static_cast<uint32_t>(source[0]) |
+                   (static_cast<uint32_t>(source[1]) << 8u) |
+                   (static_cast<uint32_t>(source[2]) << 16u) |
+                   (static_cast<uint32_t>(source[3]) << 24u);
         }
 
         void writeBe32(uint8_t *destination, uint32_t value)
@@ -199,6 +214,10 @@ namespace ps2x::iop::detail
             virtualIsoBuilt = false;
             virtualIsoValid = false;
             completionCallback.reset();
+            pendingNCommand.reset();
+            pendingDma.reset();
+            pendingNopSync = false;
+            mediaPresent = false;
             nodes.clear();
             metadataSectors.clear();
             imageHandle = 0u;
@@ -265,8 +284,21 @@ namespace ps2x::iop::detail
                 return true;
 
             case 10: // sceCdSearchFile
-                cpu.gpr[2] = searchFile(a0, a1) ? 1u : 0u;
+            {
+                const bool found = searchFile(a0, a1);
+                cpu.gpr[2] = found ? 1u : 0u;
+                if (std::getenv("PS2X_IOP_CDVD_SEARCH_TRACE") != nullptr)
+                {
+                    std::ostringstream out;
+                    out << "[IOP_CDVD_SEARCH] path='" << memory.readString(a1, 256u)
+                        << "' found=" << (found ? "true" : "false");
+                    if (found)
+                        out << " lsn=" << memory.read32(a0)
+                            << " size=" << memory.read32(a0 + 4u);
+                    host.log(LogLevel::Info, out.str());
+                }
                 return true;
+            }
 
             case 11: // sceCdSync
                 cpu.gpr[2] = 0u;
@@ -346,6 +378,154 @@ namespace ps2x::iop::detail
             default:
                 return false;
             }
+        }
+
+        bool prepareDeviceState()
+        {
+            mediaPresent = buildVirtualIso();
+            if (!mediaPresent)
+            {
+                const std::string imagePath = host.hostPath(HostPathKind::CdImage);
+                if (!imagePath.empty())
+                {
+                    if (imageHandle == 0u)
+                        imageHandle = host.openHostFile(imagePath);
+                    uint64_t imageSize = 0u;
+                    mediaPresent = imageHandle != 0u && host.hostFileSize(imageHandle, imageSize) &&
+                                   imageSize >= kSectorSize;
+                }
+            }
+            memory.setCdvdMediaState(mediaPresent, mediaPresent ? static_cast<uint8_t>(kCdvdTypePs2Dvd) : 0u);
+            return mediaPresent;
+        }
+
+        bool serviceDevice()
+        {
+            bool interrupt = false;
+            if (const auto command = memory.takeCdvdSCommand())
+            {
+                if (command->command == kCdvdSCommandUpdateStickyFlags)
+                {
+                    memory.completeCdvdSCommand(0u);
+                    interrupt = true;
+                }
+                else
+                {
+                    std::ostringstream out;
+                    out << "[IOP_CDVD_UNSUPPORTED_S_COMMAND] command=0x" << std::hex
+                        << static_cast<uint32_t>(command->command);
+                    host.log(LogLevel::Warning, out.str());
+                }
+            }
+
+            if (const auto dma = memory.takeCdvdDmaStart())
+                pendingDma = dma;
+
+            if (const auto command = memory.takeCdvdNCommand())
+            {
+                if (command->command == kCdvdNCommandNop)
+                {
+                    // NOP does not consume a channel-3 DMA arm that is being
+                    // prepared for the subsequent READ CD command.
+                    memory.completeCdvdNCommand(true, 0x02u);
+                    interrupt = true;
+                }
+                else if (command->command == kCdvdNCommandNopSync)
+                {
+                    // NOPsync waits for any prior guest N-command.
+                    if (pendingNCommand)
+                        pendingNopSync = true;
+                    else
+                    {
+                        memory.completeCdvdNCommand(true, 0x02u);
+                        interrupt = true;
+                    }
+                }
+                else
+                {
+                    pendingNCommand = command;
+                }
+            }
+
+            if (!pendingNCommand || !pendingDma)
+                return interrupt;
+
+            const IopMemory::CdvdCommand &command = *pendingNCommand;
+            const IopMemory::CdvdDmaStart &dma = *pendingDma;
+            if (command.command != kCdvdNCommandReadCd || command.parameterCount < 11u)
+            {
+                std::ostringstream out;
+                out << "[IOP_CDVD_READ_REJECTED] unsupported-command=0x" << std::hex
+                    << static_cast<uint32_t>(command.command) << " parameter-count="
+                    << std::dec << static_cast<uint32_t>(command.parameterCount);
+                host.log(LogLevel::Error, out.str());
+                pendingNCommand.reset();
+                return interrupt;
+            }
+
+            const uint32_t lsn = readLe32(command.parameters.data());
+            const uint32_t sectors = readLe32(command.parameters.data() + 4u);
+            const uint8_t blockSize = command.parameters[10u];
+            const uint32_t wordsPerBlock = dma.bcr & 0xFFFFu;
+            const uint32_t blockCount = dma.bcr >> 16u;
+            const uint64_t dmaBytes = static_cast<uint64_t>(wordsPerBlock) * blockCount * sizeof(uint32_t);
+            const uint64_t readBytes = static_cast<uint64_t>(sectors) * kSectorSize;
+            const uint32_t physicalMadr = IopMemory::physicalAddress(dma.madr);
+            const bool destinationInRam = physicalMadr <= IopMemory::RamSize &&
+                                          readBytes <= IopMemory::RamSize - physicalMadr;
+            const bool validDma = (dma.chcr & kCdvdDmaStart) != 0u &&
+                                  (dma.chcr & 1u) == 0u &&
+                                  wordsPerBlock != 0u && blockCount != 0u &&
+                                  dmaBytes == readBytes &&
+                                  destinationInRam;
+            const bool validRequest = mediaPresent && blockSize == 0u && sectors != 0u &&
+                                      readBytes <= IopMemory::RamSize && validDma;
+            if (!validRequest)
+            {
+                std::ostringstream out;
+                out << "[IOP_CDVD_READ_REJECTED] lsn=" << lsn << " sectors=" << sectors
+                    << " block_size=" << static_cast<uint32_t>(blockSize)
+                    << " dma_madr=0x" << std::hex << dma.madr << " dma_bcr=0x" << dma.bcr
+                    << " dma_chcr=0x" << dma.chcr << std::dec
+                    << " media=" << (mediaPresent ? "present" : "absent");
+                host.log(LogLevel::Error, out.str());
+                pendingNCommand.reset();
+                pendingDma.reset();
+                return interrupt;
+            }
+
+            std::vector<uint8_t> bytes;
+            if (!readSectorData(lsn, sectors, bytes) ||
+                !memory.writeRam(dma.madr, bytes.data(), bytes.size()))
+            {
+                std::ostringstream out;
+                out << "[IOP_CDVD_READ_FAILED] lsn=" << lsn << " sectors=" << sectors
+                    << " destination=0x" << std::hex << dma.madr;
+                host.log(LogLevel::Error, out.str());
+                pendingNCommand.reset();
+                pendingDma.reset();
+                return interrupt;
+            }
+
+            const uint32_t finalMadr = dma.madr + static_cast<uint32_t>(bytes.size());
+            memory.completeCdvdDma(finalMadr);
+            memory.completeCdvdNCommand(true, 0x01u);
+            if (pendingNopSync)
+            {
+                memory.completeCdvdNCommand(true, 0x02u);
+                pendingNopSync = false;
+            }
+            pendingNCommand.reset();
+            pendingDma.reset();
+            lastError = kCdvdErrorNone;
+            interrupt = true;
+
+            std::ostringstream out;
+            out << "[IOP_CDVD_DMA_READ] command=0x06 lsn=" << lsn << " sectors=" << sectors
+                << " destination=0x" << std::hex << dma.madr << std::dec
+                << " bytes=" << bytes.size() << " irq=2 result=success";
+            host.log(LogLevel::Info, out.str());
+            return interrupt;
         }
 
         std::optional<CompletionCallback> takeCompletionCallback() noexcept
@@ -476,7 +656,26 @@ namespace ps2x::iop::detail
                 node.sectors = node.size / kSectorSize;
             }
 
-            uint32_t cursor = kFirstDirectoryLsn;
+            size_t pathTableSize = 0u;
+            for (size_t nodeIndex = 0u; nodeIndex < nodes.size(); ++nodeIndex)
+            {
+                const IsoNode &node = nodes[nodeIndex];
+                if (!node.directory)
+                    continue;
+                const size_t identifierSize = nodeIndex == 0u ? 1u : node.identifier.size();
+                const size_t entrySize = 8u + identifierSize + (identifierSize & 1u);
+                if (entrySize > std::numeric_limits<size_t>::max() - pathTableSize)
+                    return false;
+                pathTableSize += entrySize;
+            }
+            if (pathTableSize == 0u || pathTableSize > std::numeric_limits<uint32_t>::max())
+                return false;
+
+            const uint32_t pathTableBytes = static_cast<uint32_t>(pathTableSize);
+            const uint32_t pathTableSectors = alignSectors(pathTableBytes);
+            const uint32_t typeLPathTableLsn = kFirstPathTableLsn;
+            const uint32_t typeMPathTableLsn = typeLPathTableLsn + pathTableSectors;
+            uint32_t cursor = typeMPathTableLsn + pathTableSectors;
             for (IsoNode &node : nodes)
             {
                 if (!node.directory)
@@ -494,6 +693,54 @@ namespace ps2x::iop::detail
             }
             volumeSectors = std::max<uint32_t>(cursor, 32u);
 
+            std::vector<uint8_t> typeLPathTable(pathTableBytes, 0u);
+            std::vector<uint8_t> typeMPathTable(pathTableBytes, 0u);
+            std::vector<uint16_t> directoryNumbers(nodes.size(), 0u);
+            uint16_t nextDirectoryNumber = 1u;
+            size_t pathTableOffset = 0u;
+            for (size_t nodeIndex = 0u; nodeIndex < nodes.size(); ++nodeIndex)
+            {
+                const IsoNode &node = nodes[nodeIndex];
+                if (!node.directory)
+                    continue;
+                if (nextDirectoryNumber == 0u)
+                    return false;
+                directoryNumbers[nodeIndex] = nextDirectoryNumber++;
+                const bool isRoot = nodeIndex == 0u;
+                const uint8_t rootIdentifier = 0u;
+                const uint8_t *identifier = isRoot
+                    ? &rootIdentifier
+                    : reinterpret_cast<const uint8_t *>(node.identifier.data());
+                const size_t identifierSize = isRoot ? 1u : node.identifier.size();
+                const uint16_t parentNumber = isRoot ? 1u : directoryNumbers[node.parent];
+                const size_t entrySize = 8u + identifierSize + (identifierSize & 1u);
+                uint8_t *typeL = typeLPathTable.data() + pathTableOffset;
+                uint8_t *typeM = typeMPathTable.data() + pathTableOffset;
+                typeL[0] = static_cast<uint8_t>(identifierSize);
+                typeM[0] = static_cast<uint8_t>(identifierSize);
+                writeLe32(typeL + 2u, node.lsn);
+                writeBe32(typeM + 2u, node.lsn);
+                writeLe16(typeL + 6u, parentNumber);
+                writeBe16(typeM + 6u, parentNumber);
+                std::memcpy(typeL + 8u, identifier, identifierSize);
+                std::memcpy(typeM + 8u, identifier, identifierSize);
+                pathTableOffset += entrySize;
+            }
+
+            const auto storePathTable = [&](const std::vector<uint8_t> &table, uint32_t firstLsn)
+            {
+                for (uint32_t sector = 0u; sector < alignSectors(table.size()); ++sector)
+                {
+                    std::array<uint8_t, kSectorSize> contents{};
+                    const size_t offset = static_cast<size_t>(sector) * kSectorSize;
+                    const size_t count = std::min<size_t>(kSectorSize, table.size() - offset);
+                    std::memcpy(contents.data(), table.data() + offset, count);
+                    metadataSectors[firstLsn + sector] = contents;
+                }
+            };
+            storePathTable(typeLPathTable, typeLPathTableLsn);
+            storePathTable(typeMPathTable, typeMPathTableLsn);
+
             std::array<uint8_t, kSectorSize> primary{};
             primary[0] = 1u;
             std::memcpy(primary.data() + 1u, "CD001", 5u);
@@ -506,6 +753,11 @@ namespace ps2x::iop::detail
             writeBoth16(primary.data() + 120u, 1u);
             writeBoth16(primary.data() + 124u, 1u);
             writeBoth16(primary.data() + 128u, static_cast<uint16_t>(kSectorSize));
+            writeBoth32(primary.data() + 132u, pathTableBytes);
+            writeLe32(primary.data() + 140u, typeLPathTableLsn);
+            writeLe32(primary.data() + 144u, 0u);
+            writeBe32(primary.data() + 148u, typeMPathTableLsn);
+            writeBe32(primary.data() + 152u, 0u);
             const uint8_t rootIdentifier = 0u;
             (void)writeDirectoryRecord(primary.data() + 156u, nodes[0].lsn, nodes[0].size, true, &rootIdentifier, 1u);
             primary[881] = 1u;
@@ -664,8 +916,24 @@ namespace ps2x::iop::detail
                 lastError = kCdvdErrorRead;
                 return false;
             }
+            std::vector<uint8_t> bytes;
+            if (!readSectorData(lsn, sectors, bytes) ||
+                !memory.writeRam(destination, bytes.data(), bytes.size()))
+            {
+                lastError = kCdvdErrorRead;
+                return false;
+            }
+            lastError = kCdvdErrorNone;
+            return true;
+        }
+
+        bool readSectorData(uint32_t lsn, uint32_t sectors, std::vector<uint8_t> &bytes)
+        {
+            const uint64_t byteCount64 = static_cast<uint64_t>(sectors) * kSectorSize;
+            if (byteCount64 > IopMemory::RamSize)
+                return false;
             const size_t byteCount = static_cast<size_t>(byteCount64);
-            std::vector<uint8_t> bytes(byteCount, 0u);
+            bytes.assign(byteCount, 0u);
 
             bool read = false;
             const std::string imagePath = host.hostPath(HostPathKind::CdImage);
@@ -698,7 +966,7 @@ namespace ps2x::iop::detail
                 }
             }
 
-            if (!read || !memory.writeRam(destination, bytes.data(), bytes.size()))
+            if (!read)
             {
                 lastError = kCdvdErrorRead;
                 return false;
@@ -720,8 +988,12 @@ namespace ps2x::iop::detail
         uint32_t lastReadTimeout = 0u;
         int interruptEventFlagId = 0;
         uint64_t imageHandle = 0u;
+        bool mediaPresent = false;
         bool virtualIsoBuilt = false;
         bool virtualIsoValid = false;
+        std::optional<IopMemory::CdvdCommand> pendingNCommand;
+        std::optional<IopMemory::CdvdDmaStart> pendingDma;
+        bool pendingNopSync = false;
         uint32_t volumeSectors = 0u;
         std::vector<IsoNode> nodes;
         std::unordered_map<uint32_t, std::array<uint8_t, kSectorSize>> metadataSectors;
@@ -737,6 +1009,16 @@ namespace ps2x::iop::detail
     void IopCdvd::reset() noexcept
     {
         m_impl->reset();
+    }
+
+    bool IopCdvd::prepareDeviceState()
+    {
+        return m_impl->prepareDeviceState();
+    }
+
+    bool IopCdvd::serviceDevice()
+    {
+        return m_impl->serviceDevice();
     }
 
     bool IopCdvd::dispatchImport(uint16_t ordinal, IopCpuState &cpu)

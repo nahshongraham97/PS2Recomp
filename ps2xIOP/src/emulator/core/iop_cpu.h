@@ -14,7 +14,13 @@ namespace ps2x::iop::detail
         uint32_t hi = 0;
         uint32_t lo = 0;
         uint32_t pc = 0;
-        std::array<uint32_t, 32> cop0{};
+        std::array<uint32_t, 32> cop0 = []
+        {
+            std::array<uint32_t, 32> registers{};
+            registers[12] = 0x00400000u; // Status.BEV, as set by PCSX2's IOP reset.
+            registers[15] = 0x0000001Fu; // PRid: the PS2 IOP R3000A revision.
+            return registers;
+        }();
         uint32_t pendingLoadReg = 0;
         uint32_t pendingLoadValue = 0;
         bool pendingLoad = false;

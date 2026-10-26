@@ -3,10 +3,18 @@
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
 
+#if defined(PS2X_ARMAGEDDON_RELOCATIONS)
+#include "relocations.h"
+#endif
+
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
+#include <iomanip>
+#include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 
 namespace
@@ -156,6 +164,14 @@ void EeScheduler::run()
 {
     assertExecutor();
     m_running.store(true, std::memory_order_release);
+    uint64_t sifSetSregEntries = 0u;
+    uint64_t sifChangeSaddrEntries = 0u;
+    uint64_t sif0HandlerEntries = 0u;
+    bool sifIdleStateLogged = false;
+    bool bindRpcFrameWatchActive = false;
+    uint32_t bindRpcFrameWatchAddress = 0u;
+    uint64_t bindRpcFrameWatchValue = 0u;
+    uint64_t bindRpcFrameWatchDispatch = 0u;
 
     while (!m_stopRequested.load(std::memory_order_acquire))
     {
@@ -170,6 +186,31 @@ void EeScheduler::run()
             GuestThread *next = selectReady();
             if (!next && m_pendingInvocations.empty())
             {
+                if (!sifIdleStateLogged && std::getenv("PS2X_SIF_TRACE_DATA") != nullptr)
+                {
+                    sifIdleStateLogged = true;
+                    uint32_t sreg0 = 0u;
+                    if (m_rdram != nullptr && 0x006505C0u <= PS2_RAM_SIZE - sizeof(sreg0))
+                        std::memcpy(&sreg0, m_rdram + 0x006505C0u, sizeof(sreg0));
+                    std::cerr << "[EE_IDLE_STATE] current_thread=" << m_currentThreadId
+                              << " pending_invocations=" << m_pendingInvocations.size()
+                              << " sreg0=0x" << std::hex << sreg0 << std::dec << std::endl;
+                    for (const auto &[id, thread] : m_threads)
+                    {
+                        std::cerr << "[EE_IDLE_THREAD] id=" << id
+                                  << " status=" << static_cast<unsigned>(thread.status)
+                                  << " wait_reason=" << static_cast<unsigned>(thread.wait.reason)
+                                  << " pc=0x" << std::hex << thread.activeContext().pc << std::dec
+                                  << " invocation_depth=" << thread.invocations.size();
+                        if (const auto *eventWait = std::get_if<EeEventFlagWait>(&thread.wait.payload))
+                            std::cerr << " event_id=" << eventWait->id
+                                      << " event_bits=0x" << std::hex << eventWait->bits
+                                      << " event_mode=0x" << eventWait->mode << std::dec;
+                        else if (const auto *semaphoreWait = std::get_if<EeSemaphoreWait>(&thread.wait.payload))
+                            std::cerr << " semaphore_id=" << semaphoreWait->id;
+                        std::cerr << std::endl;
+                    }
+                }
                 copyMainContextToRuntime();
                 publishIdleDebugContext();
                 publishSnapshot();
@@ -230,6 +271,66 @@ void EeScheduler::run()
 
         if (context.pc == 0u)
         {
+            if (std::getenv("PS2X_EE_STARTUP_FLOW_TRACE") != nullptr &&
+                running->id == kMainThreadId && context.branch_pc == 0x00114C98u)
+            {
+                const uint32_t returnSp = getRegU32(&context, 29);
+                const uint32_t savedRaAddress = returnSp - 0x10u;
+                uint64_t savedRa = 0u;
+                bool savedRaValid = false;
+                const uint32_t physical = savedRaAddress & 0x1FFFFFFFu;
+                if (m_rdram && physical <= PS2_RAM_SIZE - sizeof(savedRa))
+                {
+                    std::memcpy(&savedRa, m_rdram + physical, sizeof(savedRa));
+                    savedRaValid = true;
+                }
+                std::cerr << "[EE_BINDRPC_RETURN_FRAME] thread=" << running->id
+                          << " pc=0x" << std::hex << context.pc
+                          << " branch_pc=0x" << context.branch_pc
+                          << " ra=0x" << getRegU32(&context, 31)
+                          << " sp=0x" << returnSp
+                          << " saved_ra_addr=0x" << savedRaAddress
+                          << " saved_ra=" << (savedRaValid ? "0x" : "<invalid>");
+                if (savedRaValid)
+                    std::cerr << std::hex << savedRa;
+                std::cerr << std::dec << std::endl;
+            }
+            if (std::getenv("PS2X_SIF_TRACE_DATA") != nullptr && running->id == 1 &&
+                !running->invocations.empty() &&
+                running->invocations.back().kind == GuestInvocationKind::Interrupt)
+            {
+                const R5900Context *interrupted = &running->context;
+                if (running->invocations.size() > 1u)
+                    interrupted = &running->invocations[running->invocations.size() - 2u].context;
+                const uint32_t interruptedSp = getRegU32(interrupted, 29);
+                const uint32_t savedRaAddress = interruptedSp + 0x30u;
+                uint64_t savedRa = 0u;
+                bool savedRaValid = false;
+                const uint32_t physical = savedRaAddress & 0x1FFFFFFFu;
+                if (m_rdram && physical <= PS2_RAM_SIZE - sizeof(savedRa))
+                {
+                    std::memcpy(&savedRa, m_rdram + physical, sizeof(savedRa));
+                    savedRaValid = true;
+                }
+                std::cerr << "[EE_INTERRUPT_PARENT_STACK_AFTER] thread=" << running->id
+                          << " depth=" << running->invocations.size()
+                          << " parent_pc=0x" << std::hex << interrupted->pc
+                          << " parent_ra=0x" << getRegU32(interrupted, 31)
+                          << " parent_sp=0x" << interruptedSp
+                          << " saved_ra_addr=0x" << savedRaAddress
+                          << " saved_ra=" << (savedRaValid ? "0x" : "<invalid>");
+                if (savedRaValid)
+                    std::cerr << std::hex << savedRa;
+                std::cerr << std::dec << std::endl;
+            }
+            if (std::getenv("PS2X_SIF_TRACE_DATA") != nullptr &&
+                running->id == 1 && running->invocations.empty())
+            {
+                std::cerr << "[EE_THREAD_DORMANT] id=1 ra=0x" << std::hex
+                          << getRegU32(&context, 31)
+                          << " sp=0x" << getRegU32(&context, 29)
+                          << " branch_pc=0x" << context.branch_pc << std::dec << std::endl;
+            }
             if (!running->invocations.empty())
             {
                 GuestInvocation completed = std::move(running->invocations.back());
@@ -266,9 +367,16 @@ void EeScheduler::run()
             continue;
         }
 
+#if defined(PS2X_ARMAGEDDON_RELOCATIONS)
+        const uint32_t guestExecPc = armageddon_relocations::guestAlias(
+            context.pc, armageddon_relocations::executionPc(&context));
+        armageddon_relocations::Scope dispatchScope(&context, guestExecPc, true);
+        context.pc = armageddon_relocations::canonical(&m_runtime, context.pc);
+#endif
         if (!m_runtime.hasFunction(context.pc))
         {
-            if (!running->invocations.empty())
+            if (!running->invocations.empty() &&
+                m_runtime.missingFunctionPolicy() != PS2Runtime::MissingFunctionPolicy::Stop)
             {
                 context.pc = 0u;
             }
@@ -292,16 +400,132 @@ void EeScheduler::run()
             continue;
         }
 
+        if (std::getenv("PS2X_EE_STARTUP_FLOW_TRACE") != nullptr &&
+            running->id == kMainThreadId && context.pc == 0x00294544u)
+        {
+            const uint32_t callerSp = getRegU32(&context, 29);
+            bindRpcFrameWatchAddress = callerSp - 0x10u;
+            const uint32_t physical = bindRpcFrameWatchAddress & 0x1FFFFFFFu;
+            bindRpcFrameWatchValue = 0u;
+            const bool valid = m_rdram && physical <= PS2_RAM_SIZE - sizeof(bindRpcFrameWatchValue);
+            if (valid)
+                std::memcpy(&bindRpcFrameWatchValue, m_rdram + physical, sizeof(bindRpcFrameWatchValue));
+            bindRpcFrameWatchActive = valid;
+            bindRpcFrameWatchDispatch = 0u;
+            std::cerr << "[EE_BINDRPC_FRAME_WATCH_BEGIN] thread=" << running->id
+                      << " entry_pc=0x" << std::hex << context.pc
+                      << " caller_sp=0x" << callerSp
+                      << " saved_ra_addr=0x" << bindRpcFrameWatchAddress
+                      << " saved_ra=" << (valid ? "0x" : "<invalid>");
+            if (valid)
+                std::cerr << std::hex << bindRpcFrameWatchValue;
+            std::cerr << std::dec << std::endl;
+        }
+
         try
         {
+            const uint32_t dispatchEntryPc = context.pc;
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
             m_guestExecuting.store(true, std::memory_order_release);
+            m_runtime.diagnosticGuestDispatch(&context);
+            static uint32_t mainDispatchTraceCount = 0u;
+            const bool traceMainDispatch =
+                std::getenv("PS2X_EE_MAIN_DISPATCH_TRACE") != nullptr &&
+                running->id == kMainThreadId && mainDispatchTraceCount < 4096u;
+            if (traceMainDispatch)
+            {
+                ++mainDispatchTraceCount;
+                std::cerr << "[EE_MAIN_DISPATCH_ENTRY] n=" << mainDispatchTraceCount
+                          << " pc=0x" << std::hex << context.pc
+                          << " ra=0x" << getRegU32(&context, 31)
+                          << " v0=0x" << getRegU32(&context, 2)
+                          << " sp=0x" << getRegU32(&context, 29) << std::dec
+                          << " invocation_depth=" << running->invocations.size()
+                          << " priority=" << running->currentPriority << std::endl;
+            }
+            const bool isSif0Handler = context.pc == 0x0010FD30u;
+            if (context.pc == 0x0010F5C8u)
+                ++sifSetSregEntries;
+            else if (context.pc == 0x0010F5E8u)
+                ++sifChangeSaddrEntries;
+            if (std::getenv("PS2X_SIF_TRACE_DATA") != nullptr &&
+                (context.pc == 0x0010F5C8u || context.pc == 0x0010F5E8u))
+            {
+                std::cerr << "[EE_SIF_CALLBACK_ENTRY] pc=0x" << std::hex << context.pc << std::dec
+                          << " count=" << (context.pc == 0x0010F5C8u ? sifSetSregEntries : sifChangeSaddrEntries)
+                          << std::endl;
+            }
+            if (std::getenv("PS2X_SIF_TRACE_DATA") != nullptr && isSif0Handler)
+            {
+                ++sif0HandlerEntries;
+                std::cerr << "[EE_SIF0_HANDLER_ENTRY] count=" << sif0HandlerEntries
+                          << " thread=" << m_currentThreadId
+                          << " invocation_depth=" << running->invocations.size()
+                          << " queued_invocations=" << m_pendingInvocations.size()
+                          << " arg0=0x" << std::hex << getRegU32(&context, 4)
+                          << " arg1=0x" << getRegU32(&context, 5) << std::dec << std::endl;
+            }
             function(m_rdram, &context, &m_runtime);
+            if (bindRpcFrameWatchActive && running->id == kMainThreadId)
+            {
+                ++bindRpcFrameWatchDispatch;
+                const uint32_t physical = bindRpcFrameWatchAddress & 0x1FFFFFFFu;
+                uint64_t currentSavedRa = 0u;
+                const bool valid = m_rdram && physical <= PS2_RAM_SIZE - sizeof(currentSavedRa);
+                if (valid)
+                    std::memcpy(&currentSavedRa, m_rdram + physical, sizeof(currentSavedRa));
+                if (!valid || currentSavedRa != bindRpcFrameWatchValue)
+                {
+                    std::cerr << "[EE_BINDRPC_FRAME_WATCH_CHANGE] dispatch=" << bindRpcFrameWatchDispatch
+                              << " entry_pc=0x" << std::hex << dispatchEntryPc
+                              << " return_pc=0x" << context.pc
+                              << " branch_pc=0x" << context.branch_pc
+                              << " ra=0x" << getRegU32(&context, 31)
+                              << " sp=0x" << getRegU32(&context, 29)
+                              << " slot=0x" << bindRpcFrameWatchAddress
+                              << " old=" << (valid ? "0x" : "<invalid>") << bindRpcFrameWatchValue
+                              << " new=" << (valid ? "0x" : "<invalid>");
+                    if (valid)
+                        std::cerr << std::hex << currentSavedRa;
+                    std::cerr << std::dec << std::endl;
+                    if (valid)
+                        bindRpcFrameWatchValue = currentSavedRa;
+                    else
+                        bindRpcFrameWatchActive = false;
+                }
+            }
+            if (traceMainDispatch)
+            {
+                std::cerr << "[EE_MAIN_DISPATCH_RETURN] n=" << mainDispatchTraceCount
+                          << " pc=0x" << std::hex << context.pc
+                          << " ra=0x" << getRegU32(&context, 31)
+                          << " v0=0x" << getRegU32(&context, 2)
+                          << " sp=0x" << getRegU32(&context, 29) << std::dec
+                          << " invocation_depth=" << running->invocations.size()
+                          << " stop_requested=" << (m_stopRequested.load(std::memory_order_acquire) ? "true" : "false")
+                          << std::endl;
+            }
+            if (std::getenv("PS2X_SIF_TRACE_DATA") != nullptr && isSif0Handler)
+            {
+                std::cerr << "[EE_SIF0_HANDLER_RETURN] thread=" << m_currentThreadId
+                          << " next_pc=0x" << std::hex << context.pc << std::dec
+                          << " invocation_depth=" << running->invocations.size()
+                          << " queued_invocations=" << m_pendingInvocations.size()
+                          << std::endl;
+            }
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
         }
         catch (const EeDispatcherTransfer &)
         {
+            if (std::getenv("PS2X_EE_MAIN_DISPATCH_TRACE") != nullptr &&
+                running->id == kMainThreadId)
+            {
+                std::cerr << "[EE_MAIN_DISPATCH_TRANSFER] pc=0x" << std::hex << context.pc
+                          << " ra=0x" << getRegU32(&context, 31)
+                          << " v0=0x" << getRegU32(&context, 2) << std::dec
+                          << " invocation_depth=" << running->invocations.size() << std::endl;
+            }
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
         }
@@ -329,6 +553,10 @@ void EeScheduler::run()
     m_running.store(false, std::memory_order_release);
     copyMainContextToRuntime();
     publishSnapshot();
+    if (std::getenv("PS2X_SIF_TRACE_DATA") != nullptr)
+        std::cerr << "[SIF_TOP_LEVEL_ENTRY_COUNTS] set_sreg=" << sifSetSregEntries
+                  << " change_saddr=" << sifChangeSaddrEntries
+                  << " sif0_handler=" << sif0HandlerEntries << std::endl;
 }
 
 void EeScheduler::requestStop()
@@ -356,6 +584,8 @@ void EeScheduler::postEvent(EeEvent event)
 
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
+    if (m_runtime.diagnosticCheckpoint(currentContext(), cycles))
+        return true;
     accountCycles(cycles);
 
     if (m_checkpointPending.load(std::memory_order_acquire) ||
@@ -423,7 +653,9 @@ void EeScheduler::setupCurrentThread(uint32_t stack, uint32_t stackSize, uint32_
 int EeScheduler::createThread(const EeThreadCreateParams &params)
 {
     assertExecutor();
-    if (params.priority < 1 || params.priority >= kPriorityCount)
+    // Priority 0 is the highest valid EE thread priority. The SDK's InitThread
+    // path creates its kernel thread at priority 0 before lowering the caller.
+    if (params.priority < 0 || params.priority >= kPriorityCount)
     {
         return KE_ILLEGAL_PRIORITY;
     }
@@ -1256,8 +1488,11 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
 {
     assertExecutor();
     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
+    const bool traceSif0 = dmac && cause == 5u && std::getenv("PS2X_SIF_TRACE_DATA") != nullptr;
     if (cause < 32u && (mask & (1u << cause)) == 0u)
     {
+        if (traceSif0)
+            std::cerr << "[EE_SIF0_IRQ] cause=5 enabled=false handlers=0" << std::endl;
         return;
     }
     const auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
@@ -1273,6 +1508,92 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     }
     std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
               { return left.order < right.order; });
+    if (traceSif0)
+    {
+        std::cerr << "[EE_SIF0_IRQ] cause=5 enabled=true handlers=" << matching.size();
+        for (const EeIrqHandler &handler : matching)
+            std::cerr << " handler=0x" << std::hex << handler.handler << std::dec;
+        std::cerr << std::endl;
+
+        if (const GuestThread *owner = currentThread(); owner && owner->id == 1)
+        {
+            const R5900Context &interrupted = owner->activeContext();
+            const uint32_t interruptedSp = getRegU32(&interrupted, 29);
+            const uint32_t savedRaAddress = interruptedSp + 0x30u;
+            uint64_t savedRa = 0u;
+            bool savedRaValid = false;
+            const uint32_t physical = savedRaAddress & 0x1FFFFFFFu;
+            if (m_rdram && physical <= PS2_RAM_SIZE - sizeof(savedRa))
+            {
+                std::memcpy(&savedRa, m_rdram + physical, sizeof(savedRa));
+                savedRaValid = true;
+            }
+            std::cerr << "[EE_INTERRUPT_PARENT_STACK_BEFORE] thread=" << owner->id
+                      << " depth=" << owner->invocations.size()
+                      << " parent_pc=0x" << std::hex << interrupted.pc
+                      << " parent_ra=0x" << getRegU32(&interrupted, 31)
+                      << " parent_sp=0x" << interruptedSp
+                      << " saved_ra_addr=0x" << savedRaAddress
+                      << " saved_ra=" << (savedRaValid ? "0x" : "<invalid>");
+            if (savedRaValid)
+                std::cerr << std::hex << savedRa;
+            std::cerr << std::dec << std::endl;
+        }
+
+        // Keep the first SIF0 command packet and the guest's registered dispatch table
+        // observable at the actual EE interrupt boundary. This is diagnostic-only and
+        // reads guest RAM; it does not alter dispatch or packet contents.
+        if (m_rdram != nullptr)
+        {
+            auto readGuest32 = [this](uint32_t address, uint32_t &value)
+            {
+                const uint32_t physical = address & 0x1FFFFFFFu;
+                if (physical > PS2_RAM_SIZE - sizeof(value))
+                    return false;
+                std::memcpy(&value, m_rdram + physical, sizeof(value));
+                return true;
+            };
+            uint32_t packetAddress = 0u;
+            uint32_t callbackTable = 0u;
+            (void)readGuest32(0x00650418u, packetAddress);
+            (void)readGuest32(0x00650424u, callbackTable);
+            std::cerr << "[EE_SIF0_PACKET] packet_ptr=0x" << std::hex << packetAddress
+                      << " callback_table=0x" << callbackTable << " data=";
+            const uint32_t packetPhysical = packetAddress & 0x1FFFFFFFu;
+            if (packetAddress != 0u && packetPhysical <= PS2_RAM_SIZE - 32u)
+            {
+                for (uint32_t i = 0u; i < 32u; ++i)
+                    std::cerr << std::setw(2) << std::setfill('0')
+                              << static_cast<uint32_t>(m_rdram[packetPhysical + i]);
+            }
+            else
+            {
+                std::cerr << "<invalid>";
+            }
+            std::cerr << " cmd_data_words=";
+            for (uint32_t word = 0u; word < 7u; ++word)
+            {
+                uint32_t value = 0u;
+                (void)readGuest32(0x00650418u + word * 4u, value);
+                if (word != 0u)
+                    std::cerr << ',';
+                std::cerr << "0x" << std::hex << value;
+            }
+            const uint32_t commandIds[] = {1u, 2u, 8u, 9u};
+            for (const uint32_t command : commandIds)
+            {
+                uint32_t handlerAddress = 0u;
+                uint32_t argument = 0u;
+                uint32_t gp = 0u;
+                (void)readGuest32(callbackTable + command * 12u, handlerAddress);
+                (void)readGuest32(callbackTable + command * 12u + 4u, argument);
+                (void)readGuest32(callbackTable + command * 12u + 8u, gp);
+                std::cerr << " cmd" << command << "={handler=0x" << std::hex << handlerAddress
+                          << ",arg=0x" << argument << ",gp=0x" << gp << "}";
+            }
+            std::cerr << std::dec << std::setfill(' ') << std::endl;
+        }
+    }
     for (const EeIrqHandler &handler : matching)
     {
         GuestInvocation invocation{};
@@ -1281,7 +1602,17 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
         SET_GPR_U32(&invocation.context, 4, cause);
         SET_GPR_U32(&invocation.context, 5, handler.argument);
         SET_GPR_U32(&invocation.context, 28, handler.gp);
-        SET_GPR_U32(&invocation.context, 29, 0u);
+        // A hardware interrupt nests on the interrupted EE stack unless the
+        // handler was explicitly registered with its own stack. Starting at
+        // the shared async-callback stack top can overlap a live guest frame
+        // (the bounded Armageddon SIF0 trace caught its saved $ra being erased).
+        uint32_t interruptSp = handler.sp;
+        if (interruptSp == 0u)
+        {
+            if (const GuestThread *owner = currentThread())
+                interruptSp = getRegU32(&owner->activeContext(), 29);
+        }
+        SET_GPR_U32(&invocation.context, 29, interruptSp);
         SET_GPR_U32(&invocation.context, 31, 0u);
         queueInvocation(std::move(invocation));
     }

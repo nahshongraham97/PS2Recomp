@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.20)
 
 project(PS2Runtime VERSION 0.1.0 LANGUAGES CXX)
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -9,6 +11,20 @@ option(PS2X_ENABLE_RUNNER_UNITY_BUILD "Build ps2EntryRunner with CMake unity bui
 set(PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE 32 CACHE STRING "Unity build batch size for ps2EntryRunner")
 option(PS2X_ENABLE_RUNNER_PCH "Precompile the heavy runtime headers for ps2EntryRunner" ON)
 option(PS2X_ENABLE_SCCACHE "Use sccache as compiler launcher when available" ON)
+
+# Armageddon-specific inputs are opt-in. The relocation source contains private,
+# game-derived payload identity bytes and is supplied from the game project at
+# configure time rather than copied into this generic runtime repository.
+set(PS2X_ARMAGEDDON_RELOCATION_SOURCE "" CACHE FILEPATH
+    "Private Armageddon relocations.cpp source (empty disables Armageddon aliases)")
+set(PS2X_ARMAGEDDON_DIAGNOSTIC_MAIN "" CACHE FILEPATH
+    "Armageddon bounded diagnostic main.cpp (empty keeps the normal runner main)")
+set(PS2X_ARMAGEDDON_GENERATED_SOURCE_DIR "" CACHE PATH
+    "Hash-pinned Armageddon generated C++ directory (empty keeps the runtime checkout translations)")
+set(PS2X_ARMAGEDDON_SUPPLEMENTAL_FUNCTION_SOURCES "" CACHE STRING
+    "Semicolon-separated supplemental Armageddon translated C++ sources")
+set(PS2X_ARMAGEDDON_SUPPLEMENTAL_REGISTRATION_SOURCE "" CACHE FILEPATH
+    "Optional Armageddon source that registers supplemental functions before runner dispatch")
 
 option(PS2X_ENABLE_RUNTIME_LOGS "Enable PS2 runtime logs" ON)
 option(PS2X_ENABLE_AGRESSIVE_LOGS "Enable very verbose/agressive PS2 runtime logs" ON)
@@ -396,6 +412,17 @@ add_library(ps2_runtime STATIC
     src/lib/games_database.cpp
 )
 
+if(PS2X_ARMAGEDDON_RELOCATION_SOURCE)
+    if(NOT EXISTS "${PS2X_ARMAGEDDON_RELOCATION_SOURCE}")
+        message(FATAL_ERROR "PS2X_ARMAGEDDON_RELOCATION_SOURCE does not exist: ${PS2X_ARMAGEDDON_RELOCATION_SOURCE}")
+    endif()
+    get_filename_component(PS2X_ARMAGEDDON_RELOCATION_DIR
+        "${PS2X_ARMAGEDDON_RELOCATION_SOURCE}" DIRECTORY)
+    target_sources(ps2_runtime PRIVATE "${PS2X_ARMAGEDDON_RELOCATION_SOURCE}")
+    target_include_directories(ps2_runtime PRIVATE "${PS2X_ARMAGEDDON_RELOCATION_DIR}")
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_ARMAGEDDON_RELOCATIONS=1)
+endif()
+
 if(PS2X_ENABLE_RUNTIME_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
         PS2_RUNTIME_LOGS=1
@@ -441,6 +468,27 @@ file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
 )
 
+if(PS2X_ARMAGEDDON_GENERATED_SOURCE_DIR)
+    foreach(required_file IN ITEMS
+        "${PS2X_ARMAGEDDON_GENERATED_SOURCE_DIR}/register_functions.cpp"
+        "${PS2X_ARMAGEDDON_GENERATED_SOURCE_DIR}/ps2_recompiled_functions.h"
+        "${PS2X_ARMAGEDDON_GENERATED_SOURCE_DIR}/ps2_recompiled_stubs.h")
+        if(NOT EXISTS "${required_file}")
+            message(FATAL_ERROR "Armageddon generated source input is incomplete: ${required_file}")
+        endif()
+    endforeach()
+
+    file(GLOB ARMAGEDDON_GENERATED_CPP CONFIGURE_DEPENDS
+        "${PS2X_ARMAGEDDON_GENERATED_SOURCE_DIR}/*.cpp")
+    foreach(legacy_source IN LISTS RUNNER_SRC_FILES)
+        get_filename_component(legacy_name "${legacy_source}" NAME)
+        if(EXISTS "${PS2X_ARMAGEDDON_GENERATED_SOURCE_DIR}/${legacy_name}")
+            list(REMOVE_ITEM RUNNER_SRC_FILES "${legacy_source}")
+        endif()
+    endforeach()
+    list(APPEND RUNNER_SRC_FILES ${ARMAGEDDON_GENERATED_CPP})
+endif()
+
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
 set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
 
@@ -448,6 +496,14 @@ if(EXISTS "${RUNNER_MAIN_CPP}")
     list(APPEND RUNNER_SRC_FILES "${RUNNER_MAIN_CPP}")
 elseif(EXISTS "${ROOT_MAIN_CPP}")
     list(APPEND RUNNER_SRC_FILES "${ROOT_MAIN_CPP}")
+endif()
+
+if(PS2X_ARMAGEDDON_DIAGNOSTIC_MAIN)
+    if(NOT EXISTS "${PS2X_ARMAGEDDON_DIAGNOSTIC_MAIN}")
+        message(FATAL_ERROR "PS2X_ARMAGEDDON_DIAGNOSTIC_MAIN does not exist: ${PS2X_ARMAGEDDON_DIAGNOSTIC_MAIN}")
+    endif()
+    list(REMOVE_ITEM RUNNER_SRC_FILES "${RUNNER_MAIN_CPP}" "${ROOT_MAIN_CPP}")
+    list(APPEND RUNNER_SRC_FILES "${PS2X_ARMAGEDDON_DIAGNOSTIC_MAIN}")
 endif()
 
 if(PS2X_IS_ANDROID)
@@ -462,10 +518,67 @@ else()
     )
 endif()
 
+if(PS2X_ARMAGEDDON_GENERATED_SOURCE_DIR)
+    target_include_directories(ps2EntryRunner BEFORE PRIVATE
+        "${PS2X_ARMAGEDDON_GENERATED_SOURCE_DIR}")
+    target_sources(ps2EntryRunner PRIVATE
+        src/lib/armageddon_vu_helpers.cpp
+    )
+
+    if(BUILD_TESTING)
+        add_executable(armageddon_vu_helper_tests
+            tests/armageddon_vu_helper_tests.cpp
+            src/lib/armageddon_vu_helpers.cpp
+        )
+        target_include_directories(armageddon_vu_helper_tests PRIVATE
+            include
+            "${CMAKE_CURRENT_SOURCE_DIR}/../ps2xIOP/include"
+        )
+        target_compile_features(armageddon_vu_helper_tests PRIVATE cxx_std_20)
+        add_test(NAME armageddon_vu_helper_tests COMMAND armageddon_vu_helper_tests)
+    endif()
+endif()
+
+if(PS2X_ARMAGEDDON_SUPPLEMENTAL_FUNCTION_SOURCES)
+    foreach(supplemental_source IN LISTS PS2X_ARMAGEDDON_SUPPLEMENTAL_FUNCTION_SOURCES)
+        if(NOT EXISTS "${supplemental_source}")
+            message(FATAL_ERROR "Armageddon supplemental function source does not exist: ${supplemental_source}")
+        endif()
+    endforeach()
+    target_sources(ps2EntryRunner PRIVATE ${PS2X_ARMAGEDDON_SUPPLEMENTAL_FUNCTION_SOURCES})
+    set_source_files_properties(${PS2X_ARMAGEDDON_SUPPLEMENTAL_FUNCTION_SOURCES} PROPERTIES
+        SKIP_UNITY_BUILD_INCLUSION TRUE
+        SKIP_PRECOMPILE_HEADERS TRUE
+    )
+endif()
+
+if(PS2X_ARMAGEDDON_SUPPLEMENTAL_REGISTRATION_SOURCE)
+    if(NOT EXISTS "${PS2X_ARMAGEDDON_SUPPLEMENTAL_REGISTRATION_SOURCE}")
+        message(FATAL_ERROR
+            "Armageddon supplemental registration source does not exist: ${PS2X_ARMAGEDDON_SUPPLEMENTAL_REGISTRATION_SOURCE}")
+    endif()
+    target_sources(ps2EntryRunner PRIVATE "${PS2X_ARMAGEDDON_SUPPLEMENTAL_REGISTRATION_SOURCE}")
+    set_source_files_properties("${PS2X_ARMAGEDDON_SUPPLEMENTAL_REGISTRATION_SOURCE}" PROPERTIES
+        SKIP_UNITY_BUILD_INCLUSION TRUE
+        SKIP_PRECOMPILE_HEADERS TRUE
+    )
+    if(PS2X_ARMAGEDDON_DIAGNOSTIC_MAIN)
+        set_source_files_properties("${PS2X_ARMAGEDDON_DIAGNOSTIC_MAIN}" PROPERTIES
+            COMPILE_DEFINITIONS PS2X_ARMAGEDDON_SUPPLEMENTAL_REGISTRATION=1
+        )
+    endif()
+endif()
+
 if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
     set_target_properties(ps2EntryRunner PROPERTIES
         UNITY_BUILD ON
         UNITY_BUILD_BATCH_SIZE "${PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE}"
+    )
+endif()
+
+if(PS2X_ARMAGEDDON_DIAGNOSTIC_MAIN)
+    set_source_files_properties("${PS2X_ARMAGEDDON_DIAGNOSTIC_MAIN}" PROPERTIES
+        SKIP_UNITY_BUILD_INCLUSION TRUE
     )
 endif()
 
@@ -475,9 +588,21 @@ if(PS2X_ENABLE_RUNNER_PCH)
         "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime.h"
     )
 
+    if(PS2X_ARMAGEDDON_GENERATED_SOURCE_DIR)
+        set(PS2X_RUNNER_FUNCTIONS_HEADER
+            "${PS2X_ARMAGEDDON_GENERATED_SOURCE_DIR}/ps2_recompiled_functions.h")
+        set(PS2X_RUNNER_STUBS_HEADER
+            "${PS2X_ARMAGEDDON_GENERATED_SOURCE_DIR}/ps2_recompiled_stubs.h")
+    else()
+        set(PS2X_RUNNER_FUNCTIONS_HEADER
+            "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h")
+        set(PS2X_RUNNER_STUBS_HEADER
+            "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
+    endif()
+
     foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
+        "${PS2X_RUNNER_FUNCTIONS_HEADER}"
+        "${PS2X_RUNNER_STUBS_HEADER}")
         if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
             list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
         endif()

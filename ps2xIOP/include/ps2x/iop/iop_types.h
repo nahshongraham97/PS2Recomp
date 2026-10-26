@@ -32,6 +32,55 @@ namespace ps2x::iop
         bool handled = false;
         int32_t moduleId = -1;
         int32_t startResult = -1;
+        bool startPending = false;
+    };
+
+    struct IopModuleStartState
+    {
+        bool found = false;
+        bool pending = false;
+        bool returned = false;
+        int32_t moduleId = -1;
+        int32_t startResult = -1;
+        uint32_t entry = 0;
+        uint32_t stopPc = 0;
+        uint64_t instructions = 0;
+        uint32_t threadId = 0;
+        uint32_t threadState = 0;
+        uint32_t currentPc = 0;
+        uint32_t waitId = 0;
+        uint32_t waitBits = 0;
+        uint32_t a0 = 0;
+        uint32_t a1 = 0;
+        uint32_t ra = 0;
+    };
+
+    struct IopCallResult
+    {
+        bool found = false;
+        bool returned = false;
+        uint32_t entry = 0;
+        uint32_t stopPc = 0;
+        uint32_t instructions = 0;
+        uint32_t value = 0;
+    };
+
+    struct IopScheduledCall
+    {
+        bool found = false;
+        uint32_t id = 0;
+        uint32_t entry = 0;
+    };
+
+    struct IopScheduledCallState
+    {
+        bool found = false;
+        bool finished = false;
+        bool returned = false;
+        uint32_t entry = 0;
+        uint32_t stopPc = 0;
+        uint64_t instructions = 0;
+        uint32_t value = 0;
     };
 
     enum class RpcAbi : uint32_t
