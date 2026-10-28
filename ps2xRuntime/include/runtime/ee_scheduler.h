@@ -324,6 +324,9 @@ public:
     [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
     [[nodiscard]] bool hasInvocation(GuestInvocationKind kind, uint64_t tag) const;
     [[nodiscard]] uint32_t invocationStackTop();
+    void pushIdleInvocation() { ++m_idleInvocationDepth; }
+    void popIdleInvocation() { if (m_idleInvocationDepth > 0) --m_idleInvocationDepth; }
+    [[nodiscard]] uint32_t idleInvocationDepth() const { return m_idleInvocationDepth; }
 
     int addIrqHandler(bool dmac,
                       uint32_t cause,
@@ -459,6 +462,7 @@ private:
     uint32_t m_gsVSyncCallbackGp = 0;
     uint32_t m_gsVSyncCallbackSp = 0;
     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
+    uint32_t m_idleInvocationDepth = 0;
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
 
     mutable std::mutex m_snapshotMutex;

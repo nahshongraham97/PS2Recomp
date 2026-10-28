@@ -638,7 +638,8 @@ namespace ps2_stubs
             (void)readGuestWord(rdram, clientAddress + 0x20u, endParameter);
             std::cout << "[Armageddon HLE RPC request] source_pc=0x" << std::hex << sourcePc
                       << " source_ra=0x" << sourceRa << " sid=0x" << sid
-                      << " rpc=0x" << rpcNumber << " send=0x" << sendAddress << "/0x" << sendSize
+                      << " rpc=0x" << rpcNumber << " mode=0x" << mode
+                      << " send=0x" << sendAddress << "/0x" << sendSize
                       << " reply=0x" << receiveAddress << "/0x" << receiveSize
                       << " reply_size=0x" << receiveSize
                       << " client=0x" << clientAddress
@@ -781,10 +782,16 @@ namespace ps2_stubs
                           << std::dec << std::endl;
             };
 
-            if ((mode & 1u) != 0u)
+            const bool isLgkbmPoll = (sid == 0x61766973u && rpcNumber == 2u);
+            if ((mode & 1u) != 0u || isLgkbmPoll)
             {
+                // Method 2 polls the lgkbm event queue repeatedly. When scheduled
+                // without delay, high-priority Thread 6 starves main game Thread 1.
+                // Throttle poll completion with ~2ms (600,000 cycles) delay so Thread 1 runs.
                 constexpr uint64_t kDefaultRpcDeferCycles = 4960000ull;
-                runtime->eeScheduler().queueDeferredAction(std::move(completeRpc), kDefaultRpcDeferCycles);
+                constexpr uint64_t kLgkbmPollDeferCycles = 600000ull;
+                const uint64_t deferCycles = isLgkbmPoll ? kLgkbmPollDeferCycles : kDefaultRpcDeferCycles;
+                runtime->eeScheduler().queueDeferredAction(std::move(completeRpc), deferCycles);
                 return true;
             }
             else

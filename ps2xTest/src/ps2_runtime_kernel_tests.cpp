@@ -2053,5 +2053,93 @@ void register_ps2_runtime_kernel_tests()
             const int32_t oldPri2 = getRegS32(env.ctx, 2);
             t.Equals(oldPri2, 30, "Second change should return previous priority 30");
         });
+
+        tc.Run("EeScheduler reset clears deferred actions and invocationStackTop isolates idle frames", [](TestCase &t)
+        {
+            TestEnv env;
+            env.ctx.pc = 0x00100000u;
+            env.runtime.eeScheduler().reset(env.rdram.data(), env.ctx);
+
+            // Verify isolated stack tops for nested idle invocations and reuse for serialized
+            const uint32_t top0 = env.runtime.eeScheduler().invocationStackTop();
+            const uint32_t top0Serialized = env.runtime.eeScheduler().invocationStackTop();
+            t.IsTrue(top0 != 0u, "First idle invocation stack top must be valid non-zero");
+            t.Equals(top0Serialized, top0, "Serialized idle invocations must reuse the depth 0 stack frame");
+
+            env.runtime.eeScheduler().pushIdleInvocation();
+            const uint32_t top1 = env.runtime.eeScheduler().invocationStackTop();
+            t.IsTrue(top1 != 0u, "Second idle invocation stack top must be valid non-zero");
+            t.IsTrue(top0 != top1, "Nested idle invocation stack tops must be isolated and distinct");
+            env.runtime.eeScheduler().popIdleInvocation();
+
+            // Queue a deferred action to verify reset clears it
+            bool executed = false;
+            env.runtime.eeScheduler().queueDeferredAction([&executed]() { executed = true; }, 1000000ull);
+
+            // Reset scheduler
+            env.runtime.eeScheduler().reset(env.rdram.data(), env.ctx);
+
+            // After reset, idle invocation depth starts from 0 again
+            const uint32_t topReset0 = env.runtime.eeScheduler().invocationStackTop();
+            t.IsTrue(topReset0 != 0u, "Invocation stack top allocator must allocate valid stack on reset()");
+            t.IsFalse(executed, "Deferred action must not have executed");
+        });
+
+        tc.Run("Armageddon HLE FILEIO reply semantics and operation result preservation", [](TestCase &t)
+        {
+#ifdef _WIN32
+            _putenv("PS2X_ARMAGEDDON_HLE_BOOT=1");
+#else
+            setenv("PS2X_ARMAGEDDON_HLE_BOOT", "1", 1);
+#endif
+            PS2Runtime::IoPaths paths{};
+            paths.elfPath = "SLUS_214.10";
+            PS2Runtime::setIoPaths(paths);
+
+            TestEnv env;
+            env.ctx.pc = 0x00100000u;
+            env.runtime.eeScheduler().reset(env.rdram.data(), env.ctx);
+
+            constexpr uint32_t kPayloadAddr = 0x1000u;
+            constexpr uint32_t kResultAddr = 0x00200000u;
+            constexpr uint32_t kReplyAddr = 0x00300000u;
+
+            const int semaId = env.runtime.eeScheduler().createSemaphore(0, 10, 0u, 0u);
+            t.IsTrue(semaId > 0, "Semaphore creation should succeed");
+
+            // Stdio payload: [0]=sema, [1]=resAddr, [2]=resSize, [3]=guestHandle
+            const uint32_t payloadWords[4] = {static_cast<uint32_t>(semaId), kResultAddr, sizeof(uint32_t), 0x1234u};
+            std::memcpy(env.rdram.data() + kPayloadAddr, payloadWords, sizeof(payloadWords));
+            env.runtime.writeIopMemory(kPayloadAddr, payloadWords, sizeof(payloadWords));
+
+            const int32_t initialVal = 0x7FFFFFFF;
+            std::memcpy(env.rdram.data() + kResultAddr, &initialVal, sizeof(initialVal));
+
+            ps2x::iop::RpcRequest req{};
+            req.sid = 0x80000001u; // FILEIO
+            req.function = 1u;     // close
+            req.send.address = kPayloadAddr;
+            req.send.size = sizeof(payloadWords);
+            req.receive.address = kReplyAddr;
+            req.receive.size = sizeof(uint32_t);
+
+            const ps2x::iop::RpcResult res = armageddon_hle::handleRpc(&env.runtime, env.rdram.data(), req);
+            t.IsTrue(res.handled, "FILEIO close must be handled");
+
+            uint32_t replyToken = 0;
+            std::memcpy(&replyToken, env.rdram.data() + kReplyAddr, sizeof(replyToken));
+            int32_t opResult = 0;
+            std::memcpy(&opResult, env.rdram.data() + kResultAddr, sizeof(opResult));
+
+            t.Equals(opResult, -1, "Close on unmapped descriptor must write -1 to guest result buffer");
+            t.Equals(replyToken, 0u, "Negative operation result must produce 0u immediate reply token");
+
+#ifdef _WIN32
+            _putenv("PS2X_ARMAGEDDON_HLE_BOOT=");
+#else
+            unsetenv("PS2X_ARMAGEDDON_HLE_BOOT");
+#endif
+            PS2Runtime::setIoPaths({});
+        });
     });
 }

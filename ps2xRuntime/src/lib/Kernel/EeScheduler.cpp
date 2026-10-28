@@ -161,9 +161,13 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
         m_events.clear();
         m_deadlines.clear();
         m_pendingInvocations.clear();
-    m_deferredInvocations.clear();
-    m_nextDeferredRpcId = 0;
+        m_deferredInvocations.clear();
+        m_nextDeferredRpcId = 0;
+        m_deferredActions.clear();
+        m_nextDeferredActionId = 0;
     }
+    m_invocationStackTops.clear();
+    m_idleInvocationDepth = 0;
     m_eventSequence = 0;
     m_invocationSequence = 0;
     m_vsyncTick = 0;
@@ -1545,7 +1549,7 @@ uint32_t EeScheduler::invocationStackTop()
     assertExecutor();
     const GuestThread *owner = currentThread();
     const int32_t threadId = owner ? owner->id : 0;
-    const size_t depth = owner ? owner->invocations.size() : 0u;
+    const size_t depth = owner ? owner->invocations.size() : m_idleInvocationDepth;
     const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(threadId)) << 32u) |
                          static_cast<uint32_t>(depth);
     const auto existing = m_invocationStackTops.find(key);
