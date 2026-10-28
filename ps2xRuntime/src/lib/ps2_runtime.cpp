@@ -14,6 +14,7 @@
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
+#include "rlgl.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -3873,7 +3874,26 @@ void PS2Runtime::run()
             const std::filesystem::path screenshotPath = screenshotBase.parent_path() / screenshotName;
             // Raylib 5.5 writes screenshots to the process working directory;
             // pass a basename and let the run launch from the capture folder.
+            rlDrawRenderBatchActive();
             TakeScreenshot(screenshotName.c_str());
+            std::vector<uint8_t> frameRgba;
+            uint32_t frameW = 0u, frameH = 0u;
+            if (m_gs.copyLatchedHostPresentationFrame(frameRgba, frameW, frameH) &&
+                !frameRgba.empty() && frameW > 0u && frameH > 0u)
+            {
+                Image rawImg{
+                    .data = frameRgba.data(),
+                    .width = static_cast<int>(frameW),
+                    .height = static_cast<int>(frameH),
+                    .mipmaps = 1,
+                    .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+                const std::string rawName = screenshotBase.stem().string() + "_" +
+                                            std::to_string(elapsedSeconds) + "s_" +
+                                            std::to_string(screenshotIndex) + "_fb.png";
+                ExportImage(rawImg, rawName.c_str());
+                std::cout << "[Armageddon raw framebuffer capture] path="
+                          << (std::filesystem::current_path() / rawName).string() << std::endl;
+            }
             std::cout << "[Armageddon visible capture] elapsed_seconds=" << elapsedSeconds
                       << " index=" << screenshotIndex
                       << " path=" << (std::filesystem::current_path() / screenshotName).string() << std::endl;

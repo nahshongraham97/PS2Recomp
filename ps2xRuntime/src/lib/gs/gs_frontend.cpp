@@ -62,6 +62,8 @@ namespace
                 return false;
 
             tag.nloop = static_cast<uint32_t>(tag.lo & 0x7FFFu);
+            if (tag.nloop == 0u)
+                return false;
             tag.nreg = static_cast<uint32_t>((tag.lo >> 60u) & 0xFu);
             if (tag.nreg == 0u)
                 tag.nreg = 16u;
@@ -647,6 +649,25 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
+
+    const GSTransferSnapshot transfer = m_backend ? m_backend->GetTransferSnapshot() : GSTransferSnapshot{};
+    if (transfer.direction == 0u && transfer.copiedPixels < transfer.totalPixels)
+    {
+        const uint64_t tagLo = loadLE64(data);
+        const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+        if (nloop == 0u)
+        {
+            static uint32_t s_rawImageTraceCount = 0u;
+            if (s_rawImageTraceCount++ < 16u)
+            {
+                std::cerr << "[gs:raw_image] Forwarding raw image packet size=" << sizeBytes
+                          << " (transfer " << transfer.copiedPixels << "/" << transfer.totalPixels
+                          << " pixels)" << std::endl;
+            }
+            processImageData(data, sizeBytes);
+            return;
+        }
+    }
 
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t packetIndex = s_debugGifPacketCount.fetch_add(1, std::memory_order_relaxed);

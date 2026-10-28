@@ -4617,5 +4617,39 @@ void register_ps2_gs_tests()
             t.IsTrue(pattern2Ok,
                      "second T4HL transfer to a different DBP should be byte-correct, proving the discarded excess bytes from the first transfer did not leak into subsequent transfer state");
         });
+
+        tc.Run("GS raw image transfer packet forwarding without GIFtag", [](TestCase &t)
+        {
+            GS gs;
+            GSRegisters regs{};
+            std::vector<uint8_t> vram(4 * 1024 * 1024, 0);
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+
+            // Configure Host-to-Local transfer (PSMCT24, 4x4 = 16 pixels, 48 bytes)
+            constexpr uint32_t kDbp = 70u;
+            constexpr uint32_t kDbw = 1u;
+            constexpr uint32_t kRrw = 4u;
+            constexpr uint32_t kRrh = 4u;
+            constexpr uint64_t kBitblt = (static_cast<uint64_t>(kDbp) << 32) |
+                                         (static_cast<uint64_t>(kDbw) << 48) |
+                                         (static_cast<uint64_t>(GS_PSM_CT24) << 56);
+            constexpr uint64_t kRect = static_cast<uint64_t>(kRrw) | (static_cast<uint64_t>(kRrh) << 32);
+
+            gs.writeRegister(GS_REG_BITBLTBUF, kBitblt);
+            gs.writeRegister(GS_REG_TRXPOS, 0ull);
+            gs.writeRegister(GS_REG_TRXREG, kRect);
+            gs.writeRegister(GS_REG_TRXDIR, 0ull); // Host to Local active
+
+            // Raw packet with 48 bytes of PSMCT24 pixel data, starting with 16 zero bytes (like LOADING.RAW)
+            std::vector<uint8_t> rawPacket(48u, 0u);
+            for (size_t i = 16; i < rawPacket.size(); ++i)
+                rawPacket[i] = static_cast<uint8_t>(i * 3u + 1u);
+
+            gs.processGIFPacket(rawPacket.data(), static_cast<uint32_t>(rawPacket.size()));
+
+            const GSDebugSnapshot snap = gs.getDebugSnapshot();
+            t.Equals(snap.transferCopiedPixels, 16u, "Raw image packet without GIFtag should copy exactly 16 pixels");
+            t.Equals(snap.trxdir, 3u, "Host-to-Local transfer should be completed and idle (trxdir=3)");
+        });
     });
 }
