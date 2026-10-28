@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 
@@ -796,6 +797,16 @@ void GS::uploadImageNativeUnlocked(uint64_t bitbltbuf,
 {
     if (!data || sizeBytes == 0 || !m_backend)
         return;
+
+    static uint32_t armageddonImageTraceCount = 0u;
+    if (std::getenv("PS2X_ARMAGEDDON_HLE_BOOT") != nullptr &&
+        armageddonImageTraceCount++ < 16u)
+    {
+        std::cerr << "[Armageddon HLE GS image transfer] bitbltbuf=0x" << std::hex
+                  << bitbltbuf << " trxpos=0x" << trxpos
+                  << " trxreg=0x" << trxreg << " trxdir=0x" << trxdir
+                  << " bytes=0x" << sizeBytes << std::dec << '\n';
+    }
 
     writeRegisterUnlocked(GS_REG_BITBLTBUF, bitbltbuf);
     writeRegisterUnlocked(GS_REG_TRXPOS, trxpos);

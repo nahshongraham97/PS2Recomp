@@ -9,6 +9,14 @@
 
 namespace ps2x::iop::detail
 {
+    namespace
+    {
+        bool cdvdTraceEnabled() noexcept
+        {
+            return std::getenv("PS2X_IOP_CDVD_TRACE") != nullptr;
+        }
+    }
+
     IopIntrman::IopIntrman(IopMemory &memory) noexcept
         : m_memory(memory)
     {
@@ -36,6 +44,20 @@ namespace ps2x::iop::detail
         {
             cpu.gpr[2] = value;
         };
+
+        if (cdvdTraceEnabled() && (a0 & 0xFFu) == 0x02u &&
+            (ordinal == 4u || ordinal == 5u || ordinal == 6u || ordinal == 7u ||
+             ordinal == 8u || ordinal == 9u || ordinal == 17u || ordinal == 18u))
+        {
+            std::cerr << "[IOP_CDVD_INTRMAN_IMPORT] ordinal=" << ordinal
+                      << " pc=0x" << std::hex << cpu.pc
+                      << " irq_arg=0x" << a0 << " handler_or_arg=0x" << a2
+                      << " gp=0x" << cpu.gpr[28]
+                      << " i_stat=0x" << m_memory.interruptStatus()
+                      << " i_mask=0x" << m_memory.interruptMask()
+                      << " i_ctrl=0x" << m_memory.interruptControl()
+                      << std::dec << std::endl;
+        }
 
         switch (ordinal)
         {
@@ -120,6 +142,21 @@ namespace ps2x::iop::detail
     {
         const auto enabled = m_enabled.find(irq);
         const auto handler = m_handlers.find(irq);
+        if (irq == 0x02 && cdvdTraceEnabled())
+        {
+            std::cerr << "[IOP_CDVD_IRQ_DISPATCH] irq=0x2 enabled="
+                      << (enabled != m_enabled.end() && enabled->second ? "true" : "false")
+                      << " handler=";
+            if (handler != m_handlers.end())
+                std::cerr << "0x" << std::hex << handler->second.function << std::dec;
+            else
+                std::cerr << "missing";
+            std::cerr << " i_stat=0x" << std::hex << m_memory.interruptStatus()
+                      << " i_mask=0x" << m_memory.interruptMask()
+                      << " i_ctrl=0x" << m_memory.interruptControl()
+                      << " cdvd_i_stat=0x" << m_memory.read32(0x1F402008u)
+                      << std::dec << std::endl;
+        }
         if (irq == 0x2B && std::getenv("PS2X_SIF_TRACE_DATA") != nullptr)
         {
             std::cerr << "[SIF1_IRQ_STATE] irq=0x2b enabled="
@@ -135,13 +172,16 @@ namespace ps2x::iop::detail
         if (handler == m_handlers.end() || handler->second.function == 0u)
             return false;
 
-        (void)executor.executeGuestFunctionWithBudget(handler->second.function,
-                                                      handler->second.argument,
-                                                      0u,
-                                                      0u,
-                                                      0u,
-                                                      handler->second.gp,
-                                                      100000u);
+        const uint32_t result = executor.executeGuestFunctionWithBudget(handler->second.function,
+                                                                          handler->second.argument,
+                                                                          0u,
+                                                                          0u,
+                                                                          0u,
+                                                                          handler->second.gp,
+                                                                          100000u);
+        if (irq == 0x02 && cdvdTraceEnabled())
+            std::cerr << "[IOP_CDVD_IRQ_HANDLER_RETURN] entry=0x" << std::hex
+                      << handler->second.function << " result=0x" << result << std::dec << std::endl;
         return true;
     }
 }

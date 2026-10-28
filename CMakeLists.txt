@@ -11,6 +11,10 @@ endif()
 
 project(PS2RetroX)
 
+# Keep CTest enabled from the top-level build so tests registered in subdirs
+# are discoverable with `ctest --test-dir <build>`.
+include(CTest)
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(PS2X_BUILD_RECOMP "Build ps2xRecomp" ON)

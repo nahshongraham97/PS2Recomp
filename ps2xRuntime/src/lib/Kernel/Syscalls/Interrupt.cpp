@@ -1,6 +1,9 @@
 #include "Common.h"
 #include "Interrupt.h"
 
+#include <cstdlib>
+#include <iostream>
+
 namespace ps2_syscalls
 {
     namespace
@@ -28,18 +31,37 @@ namespace ps2_syscalls
                         PS2Runtime *runtime,
                         bool dmac)
         {
+            const uint32_t cause = getRegU32(ctx, 4);
+            const uint32_t handler = getRegU32(ctx, 5);
+            const uint32_t next = getRegU32(ctx, 6);
+            const uint32_t argument = getRegU32(ctx, 7);
+            const uint32_t gp = getRegU32(ctx, 28);
             const int id = scheduler(rdram, ctx, runtime)
                                .addIrqHandler(dmac,
-                                              getRegU32(ctx, 4),
-                                              getRegU32(ctx, 5),
-                                              getRegU32(ctx, 6) != 0u,
-                                              getRegU32(ctx, 7),
-                                              getRegU32(ctx, 28),
+                                              cause,
+                                              handler,
+                                              next != 0u,
+                                              argument,
+                                              gp,
                                               // Add*Intc/DmacHandler2's fourth argument is user data,
                                               // not a callback stack. These syscalls have no stack
                                               // parameter; let dispatchIrq use the interrupted SP.
                                               0u);
             setReturnS32(ctx, id);
+            const char *trace = std::getenv("PS2X_EE_IRQ_TRACE");
+            if (trace && trace[0] != '\0' && trace[0] != '0')
+            {
+                std::cerr << "[EE_IRQ_REGISTER] type=" << (dmac ? "DMAC" : "INTC")
+                          << " cause=" << cause
+                          << " handler_id=" << id
+                          << " handler=0x" << std::hex << handler
+                          << " arg=0x" << argument
+                          << " gp=0x" << gp
+                          << " next=" << std::dec << next
+                          << " pc=0x" << std::hex << ctx->pc
+                          << " ra=0x" << getRegU32(ctx, 31)
+                          << std::dec << '\n';
+            }
         }
 
         void removeHandler(uint8_t *rdram,

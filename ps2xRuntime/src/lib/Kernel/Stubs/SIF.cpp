@@ -4,11 +4,14 @@
 #include "../../ps2_iop_transport.h"
 #include "runtime/ps2_address.h"
 #include "runtime/ee_scheduler.h"
+#include "../../armageddon_hle.h"
 
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace ps2_stubs
@@ -289,6 +292,482 @@ namespace ps2_stubs
         }
     }
 
+    namespace
+    {
+        constexpr uint32_t kSifCmdRpcEnd = 0x80000008u;
+        constexpr uint32_t kSifCmdRpcBind = 0x80000009u;
+        constexpr uint32_t kSifCmdRpcCall = 0x8000000Au;
+
+        struct ArmageddonHleRpcServer
+        {
+            uint32_t serverAddress = 0u;
+            uint32_t bufferAddress = 0u;
+            uint32_t callbackBufferAddress = 0u;
+        };
+
+        struct ArmageddonHleRpcRegistry
+        {
+            std::mutex mutex;
+            std::unordered_map<PS2Runtime *, std::unordered_map<uint32_t, ArmageddonHleRpcServer>> serversBySid;
+            std::unordered_map<PS2Runtime *, std::unordered_map<uint32_t, uint32_t>> sidByClient;
+            std::unordered_map<PS2Runtime *, std::unordered_map<uint32_t, uint32_t>> sidByServer;
+        };
+
+        ArmageddonHleRpcRegistry g_armageddonHleRpcRegistry;
+
+        bool readGuestWord(const uint8_t *rdram, uint32_t address, uint32_t &value)
+        {
+            const uint8_t *const word = getConstMemPtr(rdram, address);
+            if (!word)
+                return false;
+            std::memcpy(&value, word, sizeof(value));
+            return true;
+        }
+
+        bool writeGuestWord(uint8_t *rdram, uint32_t address, uint32_t value)
+        {
+            uint8_t *const word = getMemPtr(rdram, address);
+            if (!word)
+                return false;
+            std::memcpy(word, &value, sizeof(value));
+            return true;
+        }
+
+        const char *armageddonHleServiceName(uint32_t sid)
+        {
+            switch (sid)
+            {
+            case 0x80000001u: return "SceStdio-FILEIO-HLE";
+            case 0x80000003u: return "FILEIO";
+            case 0x80000592u: return "CDVDFSV";
+            case 0x80000593u: return "CDVDFSV-SCMD";
+            case 0x8000059Cu: return "CDVDFSV-DiskReady";
+            case 0x80000006u: return "LOADCORE";
+            case 0x80000100u: return "PADMAN";
+            case 0x80000101u: return "PADMAN-extension";
+            case 0x80000400u:
+            case 0x80000480u: return "memory-card";
+            case 0x80000701u: return "sound";
+            default: return "unknown-generic-HLE";
+            }
+        }
+
+        bool getOrCreateArmageddonHleRpcServer(PS2Runtime *runtime,
+                                                uint32_t sid,
+                                                ArmageddonHleRpcServer &server)
+        {
+            std::lock_guard<std::mutex> lock(g_armageddonHleRpcRegistry.mutex);
+            auto &forRuntime = g_armageddonHleRpcRegistry.serversBySid[runtime];
+            const auto existing = forRuntime.find(sid);
+            if (existing != forRuntime.end())
+            {
+                server = existing->second;
+                return true;
+            }
+
+            // These are real IOP-RAM allocations used only as opaque host-server
+            // addresses in the EE RPC data structures. No guest IOP code is run.
+            ArmageddonHleRpcServer created{};
+            created.serverAddress = runtime->allocateIopMemory(0x50u, 64u);
+            created.bufferAddress = runtime->allocateIopMemory(0x1000u, 64u);
+            created.callbackBufferAddress = runtime->allocateIopMemory(0x100u, 64u);
+            if (created.serverAddress == 0u || created.bufferAddress == 0u ||
+                created.callbackBufferAddress == 0u)
+            {
+                if (created.callbackBufferAddress != 0u)
+                    (void)runtime->freeIopMemory(created.callbackBufferAddress);
+                if (created.bufferAddress != 0u)
+                    (void)runtime->freeIopMemory(created.bufferAddress);
+                if (created.serverAddress != 0u)
+                    (void)runtime->freeIopMemory(created.serverAddress);
+                return false;
+            }
+
+            std::array<uint32_t, 0x50u / sizeof(uint32_t)> descriptor{};
+            descriptor[0] = sid; // SifRpcServerData_t::sid
+            descriptor[2] = created.bufferAddress; // buf
+            descriptor[3] = 0x1000u; // size
+            descriptor[5] = created.callbackBufferAddress; // cbuf
+            descriptor[6] = 0x100u; // size2
+            if (!runtime->writeIopMemory(created.serverAddress,
+                                         descriptor.data(),
+                                         sizeof(descriptor)))
+            {
+                (void)runtime->freeIopMemory(created.callbackBufferAddress);
+                (void)runtime->freeIopMemory(created.bufferAddress);
+                (void)runtime->freeIopMemory(created.serverAddress);
+                return false;
+            }
+
+            server = created;
+            forRuntime.emplace(sid, created);
+            g_armageddonHleRpcRegistry.sidByServer[runtime][created.serverAddress] = sid;
+            return true;
+        }
+
+        bool getArmageddonHleRpcServer(PS2Runtime *runtime,
+                                       uint32_t serverAddress,
+                                       uint32_t &sid,
+                                       ArmageddonHleRpcServer &server)
+        {
+            std::lock_guard<std::mutex> lock(g_armageddonHleRpcRegistry.mutex);
+            const auto runtimeServers = g_armageddonHleRpcRegistry.serversBySid.find(runtime);
+            const auto runtimeSids = g_armageddonHleRpcRegistry.sidByServer.find(runtime);
+            if (runtimeServers == g_armageddonHleRpcRegistry.serversBySid.end() ||
+                runtimeSids == g_armageddonHleRpcRegistry.sidByServer.end())
+                return false;
+            const auto sidEntry = runtimeSids->second.find(serverAddress);
+            if (sidEntry == runtimeSids->second.end())
+                return false;
+            const auto serverEntry = runtimeServers->second.find(sidEntry->second);
+            if (serverEntry == runtimeServers->second.end())
+                return false;
+            sid = sidEntry->second;
+            server = serverEntry->second;
+            return true;
+        }
+
+        void rememberArmageddonHleRpcClient(PS2Runtime *runtime, uint32_t clientAddress, uint32_t sid)
+        {
+            std::lock_guard<std::mutex> lock(g_armageddonHleRpcRegistry.mutex);
+            g_armageddonHleRpcRegistry.sidByClient[runtime][clientAddress] = sid;
+        }
+
+        uint32_t getArmageddonHleRpcClientSid(PS2Runtime *runtime, uint32_t clientAddress)
+        {
+            std::lock_guard<std::mutex> lock(g_armageddonHleRpcRegistry.mutex);
+            const auto runtimeClients = g_armageddonHleRpcRegistry.sidByClient.find(runtime);
+            if (runtimeClients == g_armageddonHleRpcRegistry.sidByClient.end())
+                return 0u;
+            const auto client = runtimeClients->second.find(clientAddress);
+            return client == runtimeClients->second.end() ? 0u : client->second;
+        }
+
+        bool completeArmageddonHleRpcBind(uint8_t *rdram,
+                                          PS2Runtime *runtime,
+                                          uint32_t packetAddress,
+                                          uint32_t packetSize,
+                                          uint32_t sourcePc,
+                                          uint32_t sourceRa)
+        {
+            if (!armageddon_hle::enabled(runtime) || packetSize < 36u || packetSize > 112u)
+                return false;
+
+            std::array<uint8_t, 112u> request{};
+            if (!readEeRange(rdram, packetAddress, request.data(), packetSize))
+                return false;
+            uint32_t commandId = 0u;
+            std::memcpy(&commandId, request.data() + 8u, sizeof(commandId));
+            if (commandId != kSifCmdRpcBind)
+                return false;
+
+            uint32_t sid = 0u;
+            uint32_t clientAddress = 0u;
+            std::memcpy(&clientAddress, request.data() + 28u, sizeof(clientAddress));
+            std::memcpy(&sid, request.data() + 32u, sizeof(sid));
+            uint32_t semaWord = 0xFFFFFFFFu;
+            if (clientAddress == 0u || !readGuestWord(rdram, clientAddress + 8u, semaWord))
+                return false;
+            uint32_t endFunction = 0u;
+            uint32_t endParameter = 0u;
+            (void)readGuestWord(rdram, clientAddress + 0x1Cu, endFunction);
+            (void)readGuestWord(rdram, clientAddress + 0x20u, endParameter);
+
+            ArmageddonHleRpcServer server{};
+            if (!getOrCreateArmageddonHleRpcServer(runtime, sid, server))
+            {
+                std::cerr << "[Armageddon HLE RPC bind] sid=0x" << std::hex << sid
+                          << " service=" << armageddonHleServiceName(sid)
+                          << " result=host-server-allocation-failed\n" << std::dec;
+                return false;
+            }
+            rememberArmageddonHleRpcClient(runtime, clientAddress, sid);
+
+            std::array<uint8_t, 64u> reply{};
+            std::memcpy(reply.data(), request.data(), 4u); // preserve the packet size word
+            const uint32_t replyCommand = kSifCmdRpcEnd;
+            std::memcpy(reply.data() + 8u, &replyCommand, sizeof(replyCommand));
+            std::memcpy(reply.data() + 16u, request.data() + 16u, 16u); // rec_id, pkt_addr, rpc_id, client
+            const uint32_t originalCommand = kSifCmdRpcBind;
+            std::memcpy(reply.data() + 32u, &originalCommand, sizeof(originalCommand));
+            std::memcpy(reply.data() + 36u, &server.serverAddress, sizeof(server.serverAddress));
+            std::memcpy(reply.data() + 40u, &server.bufferAddress, sizeof(server.bufferAddress));
+            std::memcpy(reply.data() + 44u, &server.callbackBufferAddress, sizeof(server.callbackBufferAddress));
+
+            const bool guestCallbackQueued = dispatchSifCommand(rdram,
+                                                                runtime,
+                                                                kSifCmdRpcEnd,
+                                                                reply.data(),
+                                                                reply.size());
+            bool directCompletion = false;
+            if (!guestCallbackQueued)
+            {
+                // Same client fields and semaphore handoff as the SDK's
+                // _request_end(RPC_BIND) callback, with the shortcut explicit.
+                const bool clientUpdated =
+                    writeGuestWord(rdram, clientAddress + 0x14u, server.bufferAddress) &&
+                    writeGuestWord(rdram, clientAddress + 0x18u, server.callbackBufferAddress) &&
+                    writeGuestWord(rdram, clientAddress + 0x24u, server.serverAddress);
+                if (!clientUpdated)
+                    return false;
+                if (static_cast<int32_t>(semaWord) >= 0)
+                    directCompletion = runtime->eeScheduler().signalSemaphore(static_cast<int32_t>(semaWord), true) >= 0;
+            }
+
+            std::cout << "[Armageddon HLE RPC bind] sid=0x" << std::hex << sid
+                      << " source_pc=0x" << sourcePc << " source_ra=0x" << sourceRa
+                      << " service=" << armageddonHleServiceName(sid)
+                      << " client=0x" << clientAddress
+                      << " sema=" << static_cast<int32_t>(semaWord)
+                      << " end_function=0x" << endFunction
+                      << " end_parameter=0x" << endParameter
+                      << " server=0x" << server.serverAddress
+                      << " buffer=0x" << server.bufferAddress
+                      << " callback_buffer=0x" << server.callbackBufferAddress
+                      << " reply_size=0x40 reply=RPC_END route=" << (guestCallbackQueued ? "guest-command-handler-8"
+                                                        : (directCompletion ? "documented-host-completion-fallback" : "host-completion-failed"))
+                      << (std::strcmp(armageddonHleServiceName(sid), "unknown-generic-HLE") == 0
+                              ? " default=unimplemented-until-request"
+                              : "")
+                      << std::dec << std::endl;
+            return guestCallbackQueued || directCompletion || static_cast<int32_t>(semaWord) < 0;
+        }
+
+        bool completeArmageddonHleRpcCall(uint8_t *rdram,
+                                          PS2Runtime *runtime,
+                                          R5900Context *ctx,
+                                          uint32_t packetAddress,
+                                          uint32_t packetSize,
+                                          const Ps2SifDmaTransfer *transfers,
+                                          uint32_t transferCount,
+                                          uint32_t sourcePc,
+                                          uint32_t sourceRa)
+        {
+            if (!armageddon_hle::enabled(runtime) || packetSize < 56u || packetSize > 112u)
+                return false;
+
+            std::array<uint8_t, 112u> requestBytes{};
+            if (!readEeRange(rdram, packetAddress, requestBytes.data(), packetSize))
+                return false;
+            uint32_t commandId = 0u;
+            std::memcpy(&commandId, requestBytes.data() + 8u, sizeof(commandId));
+            if (commandId != kSifCmdRpcCall)
+                return false;
+
+            auto readPacketWord = [&](size_t offset, uint32_t &value)
+            {
+                if (offset + sizeof(value) > packetSize)
+                    return false;
+                std::memcpy(&value, requestBytes.data() + offset, sizeof(value));
+                return true;
+            };
+
+            uint32_t clientAddress = 0u, rpcNumber = 0u, sendSize = 0u;
+            uint32_t receiveAddress = 0u, receiveSize = 0u, mode = 0u, serverAddress = 0u;
+            if (!readPacketWord(28u, clientAddress) || !readPacketWord(32u, rpcNumber) ||
+                !readPacketWord(36u, sendSize) || !readPacketWord(40u, receiveAddress) ||
+                !readPacketWord(44u, receiveSize) || !readPacketWord(48u, mode) ||
+                !readPacketWord(52u, serverAddress))
+                return false;
+
+            uint32_t sid = 0u;
+            ArmageddonHleRpcServer server{};
+            if (!getArmageddonHleRpcServer(runtime, serverAddress, sid, server))
+                sid = getArmageddonHleRpcClientSid(runtime, clientAddress);
+            if (sid == 0u)
+            {
+                std::cerr << "[Armageddon HLE RPC call] unresolved server"
+                          << " client=0x" << std::hex << clientAddress
+                          << " server=0x" << serverAddress << std::dec << std::endl;
+                return false;
+            }
+            if (server.serverAddress == 0u)
+            {
+                uint32_t ignoredSid = 0u;
+                if (!getArmageddonHleRpcServer(runtime, serverAddress, ignoredSid, server))
+                    return false;
+            }
+
+            uint32_t packetSourceAddress = 0u;
+            std::memcpy(&packetSourceAddress, requestBytes.data() + 20u, sizeof(packetSourceAddress));
+            uint32_t sendAddress = server.bufferAddress;
+            if (sendSize != 0u)
+            {
+                bool foundPayload = false;
+                for (uint32_t i = 0u; i < transferCount; ++i)
+                {
+                    const Ps2SifDmaTransfer &transfer = transfers[i];
+                    if (transfer.dest == server.bufferAddress && transfer.size >= 0 &&
+                        static_cast<uint32_t>(transfer.size) >= sendSize)
+                    {
+                        sendAddress = transfer.dest;
+                        foundPayload = true;
+                        break;
+                    }
+                }
+                if (!foundPayload || !runtime->isIopMemoryRange(sendAddress, sendSize))
+                {
+                    std::cerr << "[Armageddon HLE RPC call] missing-send-transfer sid=0x"
+                              << std::hex << sid << " rpc=0x" << rpcNumber
+                              << " size=0x" << sendSize << " server_buffer=0x" << server.bufferAddress
+                              << std::dec << std::endl;
+                    return false;
+                }
+            }
+
+            ps2x::iop::RpcRequest rpcRequest{};
+            rpcRequest.clientAddress = clientAddress;
+            rpcRequest.serverAddress = serverAddress;
+            rpcRequest.serverFunction = 0u;
+            rpcRequest.serverBuffer = server.bufferAddress;
+            rpcRequest.sid = sid;
+            rpcRequest.function = rpcNumber;
+            rpcRequest.mode = mode;
+            rpcRequest.send = {sendAddress, sendSize};
+            rpcRequest.receive = {receiveAddress, receiveSize};
+
+            uint32_t semaWord = 0xFFFFFFFFu;
+            uint32_t endFunction = 0u;
+            uint32_t endParameter = 0u;
+            (void)readGuestWord(rdram, clientAddress + 8u, semaWord);
+            (void)readGuestWord(rdram, clientAddress + 0x1Cu, endFunction);
+            (void)readGuestWord(rdram, clientAddress + 0x20u, endParameter);
+            std::cout << "[Armageddon HLE RPC request] source_pc=0x" << std::hex << sourcePc
+                      << " source_ra=0x" << sourceRa << " sid=0x" << sid
+                      << " rpc=0x" << rpcNumber << " send=0x" << sendAddress << "/0x" << sendSize
+                      << " reply=0x" << receiveAddress << "/0x" << receiveSize
+                      << " reply_size=0x" << receiveSize
+                      << " client=0x" << clientAddress
+                      << " client_sema=0x" << semaWord
+                      << " end_function=0x" << endFunction
+                      << " end_parameter=0x" << endParameter
+                      << std::dec << std::endl;
+
+            const ps2x::iop::RpcResult result = armageddon_hle::handleRpc(runtime, rdram, rpcRequest);
+            if (!result.handled)
+            {
+                std::cerr << "[Armageddon HLE RPC call] no-host-handler sid=0x"
+                          << std::hex << sid << " rpc=0x" << rpcNumber
+                          << " reply_size=0x" << receiveSize
+                          << " action=fail-stop-no-synthetic-reply" << std::dec << std::endl;
+                runtime->requestStop();
+                return false;
+            }
+
+            if (!readGuestWord(rdram, clientAddress + 8u, semaWord) ||
+                !readGuestWord(rdram, clientAddress + 0x1Cu, endFunction))
+                return false;
+
+            std::array<uint8_t, 64u> reply{};
+            std::memcpy(reply.data(), requestBytes.data(), 4u);
+            const uint32_t replyCommand = kSifCmdRpcEnd;
+            std::memcpy(reply.data() + 8u, &replyCommand, sizeof(replyCommand));
+            std::memcpy(reply.data() + 16u, requestBytes.data() + 16u, 16u);
+            const uint32_t originalCommand = kSifCmdRpcCall;
+            std::memcpy(reply.data() + 32u, &originalCommand, sizeof(originalCommand));
+            std::memcpy(reply.data() + 36u, &serverAddress, sizeof(serverAddress));
+            std::memcpy(reply.data() + 40u, &server.bufferAddress, sizeof(server.bufferAddress));
+            std::memcpy(reply.data() + 44u, &server.callbackBufferAddress, sizeof(server.callbackBufferAddress));
+
+            const bool guestCallbackQueued = dispatchSifCommand(rdram,
+                                                                runtime,
+                                                                kSifCmdRpcEnd,
+                                                                reply.data(),
+                                                                reply.size());
+            bool directCompletion = false;
+            if (!guestCallbackQueued)
+            {
+                if (endFunction != 0u)
+                {
+                    uint32_t callbackFunction = endFunction;
+                    if (!runtime->hasFunction(callbackFunction) && callbackFunction >= 0x10000u &&
+                        runtime->hasFunction(callbackFunction - 0x10000u))
+                    {
+                        callbackFunction -= 0x10000u;
+                    }
+                    if (!ctx || !runtime->hasFunction(callbackFunction))
+                    {
+                        std::cerr << "[Armageddon HLE RPC call] end-callback-unresolved"
+                                  << " guest_function=0x" << std::hex << endFunction
+                                  << " client=0x" << clientAddress
+                                  << " action=fail-stop" << std::dec << std::endl;
+                        runtime->requestStop();
+                        return false;
+                    }
+
+                    uint32_t recordId = 0u;
+                    std::memcpy(&recordId, requestBytes.data() + 16u, sizeof(recordId));
+                    GuestInvocation callback{};
+                    callback.kind = GuestInvocationKind::RpcCallback;
+                    callback.context = *ctx;
+                    callback.context.pc = callbackFunction;
+                    SET_GPR_U32(&callback.context, 4, endParameter);
+                    SET_GPR_U32(&callback.context, 29, runtime->eeScheduler().invocationStackTop());
+                    SET_GPR_U32(&callback.context, 31, 0u);
+                    callback.onComplete = [runtime, rdram, clientAddress, packetAddress,
+                                           recordId, semaWord, sid, rpcNumber](const R5900Context &, R5900Context &)
+                    {
+                        const bool clientCleared = writeGuestWord(rdram, clientAddress, 0u);
+                        const bool packetReleased = writeGuestWord(rdram, packetAddress + 16u, recordId & ~1u);
+                        bool semaphoreSignaled = false;
+                        if (static_cast<int32_t>(semaWord) >= 0)
+                        {
+                            semaphoreSignaled = runtime->eeScheduler().signalSemaphore(
+                                static_cast<int32_t>(semaWord), true) >= 0;
+                        }
+                        std::cout << "[Armageddon HLE RPC callback completion] sid=0x" << std::hex << sid
+                                  << " rpc=0x" << rpcNumber << " client=0x" << clientAddress
+                                  << " client_cleared=" << (clientCleared ? "true" : "false")
+                                  << " packet_released=" << (packetReleased ? "true" : "false")
+                                  << " semaphore_signaled=" << (semaphoreSignaled ? "true" : "false")
+                                  << std::dec << std::endl;
+                    };
+                    try
+                    {
+                        runtime->eeScheduler().queueInvocation(std::move(callback));
+                    }
+                    catch (...)
+                    {
+                        std::cerr << "[Armageddon HLE RPC call] end-callback-queue-failed"
+                                  << " guest_function=0x" << std::hex << callbackFunction
+                                  << " sid=0x" << sid << " rpc=0x" << rpcNumber
+                                  << " action=fail-stop" << std::dec << std::endl;
+                        runtime->requestStop();
+                        return false;
+                    }
+                }
+                else
+                {
+                    (void)writeGuestWord(rdram, clientAddress, 0u); // _request_end clears hdr.pkt_addr
+                    uint32_t recordId = 0u;
+                    std::memcpy(&recordId, requestBytes.data() + 16u, sizeof(recordId));
+                    (void)writeGuestWord(rdram, packetAddress + 16u, recordId & ~1u); // release RPC packet
+                    if (static_cast<int32_t>(semaWord) >= 0)
+                        directCompletion = runtime->eeScheduler().signalSemaphore(static_cast<int32_t>(semaWord), true) >= 0;
+                }
+            }
+
+            std::cout << "[Armageddon HLE RPC call completion] sid=0x" << std::hex << sid
+                      << " source_pc=0x" << sourcePc << " source_ra=0x" << sourceRa
+                      << " rpc=0x" << rpcNumber << " client=0x" << clientAddress
+                      << " server=0x" << serverAddress << " send=0x" << sendAddress
+                      << "/0x" << sendSize << " recv=0x" << receiveAddress << "/0x" << receiveSize
+                      << " reply_size=0x" << receiveSize << " reply_packet_size=0x40"
+                      << " client_sema=0x" << semaWord
+                      << " direct_completion=" << (directCompletion ? "true" : "false")
+                      << " result=handled reply=RPC_END route="
+                      << (guestCallbackQueued ? "guest-command-handler-8"
+                                             : (endFunction != 0u
+                                                    ? "guest-end-callback-queued"
+                                                    : (directCompletion || static_cast<int32_t>(semaWord) < 0
+                                                    ? "documented-host-completion-fallback"
+                                                    : "host-completion-failed")))
+                      << " end_function=0x" << endFunction
+                      << " packet_source=0x" << packetSourceAddress << std::dec << std::endl;
+            return guestCallbackQueued || endFunction != 0u || directCompletion || static_cast<int32_t>(semaWord) < 0;
+        }
+    }
+
     void sceSifAddCmdHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t cid = getRegU32(ctx, 4);
@@ -465,6 +944,27 @@ namespace ps2_stubs
     {
         const uint32_t reg = getRegU32(ctx, 4);
         uint32_t value = 0u;
+        if (armageddon_hle::readSifRegister(runtime, reg, value))
+        {
+            if (reg == 4u)
+            {
+                constexpr uint32_t kArmageddonSreg0Address = 0x006505C0u;
+                const uint32_t assumedSreg0 = 1u;
+                if (uint8_t *const sreg0 = getMemPtr(rdram, kArmageddonSreg0Address))
+                {
+                    std::memcpy(sreg0, &assumedSreg0, sizeof(assumedSreg0));
+                    std::cout << "[Armageddon HLE assumption] publish SREG[0]=1"
+                              << " guest_address=0x006505C0 source=host" << std::endl;
+                }
+                else
+                {
+                    std::cerr << "[Armageddon HLE error] cannot publish SREG[0]"
+                              << " guest_address=0x006505C0" << std::endl;
+                }
+            }
+            setReturnU32(ctx, value);
+            return;
+        }
         bool shouldLog = false;
         if (reg >= 1u && reg <= 4u)
         {
@@ -510,6 +1010,11 @@ namespace ps2_stubs
     {
         const uint32_t reg = getRegU32(ctx, 4);
         uint32_t value = 0u;
+        if (armageddon_hle::readSifSreg(runtime, rdram, reg, value))
+        {
+            setReturnU32(ctx, value);
+            return;
+        }
         {
             std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
             auto it = g_sifSregs.find(reg);
@@ -571,6 +1076,11 @@ namespace ps2_stubs
 
     void sceSifRebootIop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (armageddon_hle::skipIopReset(runtime, ctx, "sceSifRebootIop"))
+        {
+            setReturnS32(ctx, 1);
+            return;
+        }
         PS2IopTransport::reset(runtime);
         setReturnS32(ctx, 1);
     }
@@ -600,6 +1110,11 @@ namespace ps2_stubs
 
     void sceSifResetIop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (armageddon_hle::skipIopReset(runtime, ctx, "sceSifResetIop"))
+        {
+            setReturnS32(ctx, 1);
+            return;
+        }
         PS2IopTransport::reset(runtime);
         setReturnS32(ctx, 1);
     }
@@ -788,6 +1303,29 @@ namespace ps2_stubs
             }
             setReturnS32(ctx, 0);
             return;
+        }
+
+        if (armageddon_hle::enabled(runtime))
+        {
+            for (uint32_t i = 0u; i < pendingCount; ++i)
+            {
+                const Ps2SifDmaTransfer &xfer = pending[i];
+                (void)completeArmageddonHleRpcBind(rdram,
+                                                   runtime,
+                                                   xfer.src,
+                                                   static_cast<uint32_t>(xfer.size),
+                                                   ctx ? ctx->pc : 0u,
+                                                   ctx ? getRegU32(ctx, 31) : 0u);
+                (void)completeArmageddonHleRpcCall(rdram,
+                                                   runtime,
+                                                   ctx,
+                                                   xfer.src,
+                                                   static_cast<uint32_t>(xfer.size),
+                                                   pending.data(),
+                                                   pendingCount,
+                                                   ctx ? ctx->pc : 0u,
+                                                   ctx ? getRegU32(ctx, 31) : 0u);
+            }
         }
 
         ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, 5u);

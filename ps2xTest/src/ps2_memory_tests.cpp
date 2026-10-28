@@ -1838,6 +1838,17 @@ void register_ps2_memory_tests()
             constexpr uint32_t kGifStatusBit = (1u << 2); // channel 2 status
             constexpr uint32_t kSummaryBit = (1u << 31);
 
+            for (uint32_t channel = 0u; channel < 10u; ++channel)
+            {
+                const uint32_t maskBit = 1u << (16u + channel);
+                t.IsTrue(mem.writeIORegister(kDStat, maskBit), "D_STAT mask write should succeed");
+                t.IsTrue((mem.readIORegister(kDStat) & maskBit) != 0u,
+                         "each D_STAT mask bit 16-25 should toggle on");
+                t.IsTrue(mem.writeIORegister(kDStat, maskBit), "D_STAT mask write should succeed");
+                t.IsTrue((mem.readIORegister(kDStat) & maskBit) == 0u,
+                         "each D_STAT mask bit 16-25 should toggle off");
+            }
+
             t.IsTrue(mem.writeIORegister(kDStat, kGifMaskBit), "D_STAT mask toggle write should succeed");
             t.IsTrue((mem.readIORegister(kDStat) & kGifMaskBit) != 0u, "first mask write should enable GIF mask bit");
             t.IsTrue(mem.writeIORegister(kDStat, kGifMaskBit), "D_STAT mask toggle write should succeed");
@@ -1869,6 +1880,43 @@ void register_ps2_memory_tests()
             const uint32_t dstatCleared = mem.readIORegister(kDStat);
             t.IsTrue((dstatCleared & kGifStatusBit) == 0u, "write-one should clear GIF channel status bit");
             t.IsTrue((dstatCleared & kSummaryBit) == 0u, "summary bit should clear after status clear");
+        });
+
+        tc.Run("INTC_MASK writes toggle bits 0-14 and INTC_STAT acknowledges W1C", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kIntcStat = 0x1000F000u;
+            constexpr uint32_t kIntcMask = 0x1000F010u;
+            for (uint32_t cause = 0u; cause < 15u; ++cause)
+            {
+                const uint32_t bit = 1u << cause;
+                t.IsTrue(mem.writeIORegister(kIntcMask, bit), "INTC_MASK write should succeed");
+                t.IsTrue((mem.readIORegister(kIntcMask) & bit) != 0u,
+                         "INTC_MASK write-one should reverse the selected cause bit on");
+                t.IsTrue(mem.writeIORegister(kIntcMask, 0u), "INTC_MASK zero write should succeed");
+                t.IsTrue((mem.readIORegister(kIntcMask) & bit) != 0u,
+                         "INTC_MASK zero write should leave selected cause bit unchanged");
+                t.IsTrue(mem.writeIORegister(kIntcMask, bit), "INTC_MASK write should succeed");
+                t.IsTrue((mem.readIORegister(kIntcMask) & bit) == 0u,
+                         "second INTC_MASK write-one should reverse the selected cause bit off");
+            }
+
+            t.IsTrue(mem.writeIORegister(kIntcStat, 0x5u), "INTC_STAT ack should succeed");
+            t.Equals(mem.readIORegister(kIntcStat), 0u,
+                     "INTC_STAT write-one should acknowledge status without setting it");
+
+            for (uint32_t cause = 0u; cause < 15u; ++cause)
+            {
+                const uint32_t bit = 1u << cause;
+                t.IsTrue(mem.writeIORegister(0xFFFFFFFCu, bit), "host INTC event should latch");
+                t.IsTrue((mem.readIORegister(kIntcStat) & bit) != 0u,
+                         "hardware cause should remain visible without a guest handler or mask");
+                t.IsTrue(mem.writeIORegister(kIntcStat, bit), "INTC_STAT ack should succeed");
+                t.IsTrue((mem.readIORegister(kIntcStat) & bit) == 0u,
+                         "guest acknowledgement should clear exactly the latched cause");
+            }
         });
 
         tc.Run("DMAC D_CTRL DMAE gates GIF DMA start", [](TestCase &t)

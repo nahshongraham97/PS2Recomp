@@ -15,6 +15,12 @@ namespace ps2_syscalls
             return value && value[0] == '1';
         }
 
+        bool eeExitTraceEnabled()
+        {
+            const char *value = std::getenv("PS2X_EE_EXIT_TRACE");
+            return value && value[0] == '1';
+        }
+
         EeScheduler &scheduler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         {
             EeScheduler &result = runtime->eeScheduler();
@@ -149,7 +155,36 @@ namespace ps2_syscalls
                               bool interruptSafe)
         {
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
-            const int result = ee.wakeupThread(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
+            const int targetThread = static_cast<int>(getRegU32(ctx, 4));
+            const char *trace = std::getenv("PS2X_EE_SEMA_TRACE");
+            if (trace && trace[0] != '\0' && trace[0] != '0')
+            {
+                static uint32_t records = 0u;
+                if (records < 512u)
+                {
+                    ++records;
+                    std::cerr << "[EE_SEMA_TRACE] op=" << (interruptSafe ? "iwakeup-before" : "wakeup-before")
+                              << " target_thread=" << targetThread
+                              << " pc=0x" << std::hex << ctx->pc
+                              << " ra=0x" << getRegU32(ctx, 31)
+                              << std::dec << " current_thread=" << ee.currentThreadId() << '\n';
+                }
+            }
+            const int result = ee.wakeupThread(targetThread, interruptSafe);
+            if (trace && trace[0] != '\0' && trace[0] != '0')
+            {
+                static uint32_t recordsAfter = 0u;
+                if (recordsAfter < 512u)
+                {
+                    ++recordsAfter;
+                    std::cerr << "[EE_SEMA_TRACE] op=" << (interruptSafe ? "iwakeup-after" : "wakeup-after")
+                              << " target_thread=" << targetThread
+                              << " result=" << result
+                              << " pc=0x" << std::hex << ctx->pc
+                              << " ra=0x" << getRegU32(ctx, 31)
+                              << std::dec << " current_thread=" << ee.currentThreadId() << '\n';
+                }
+            }
             setReturnS32(ctx, result);
             ee.transferIfRequested(interruptSafe);
         }
@@ -334,6 +369,17 @@ namespace ps2_syscalls
     void ExitThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
+        if (eeExitTraceEnabled())
+        {
+            std::cerr << "[EE_EXIT_TRACE] ExitThread tid=" << ee.currentThreadId()
+                      << " pc=0x" << std::hex << ctx->pc
+                      << " ra=0x" << getRegU32(ctx, 31)
+                      << " a0_status=0x" << getRegU32(ctx, 4)
+                      << " v0=0x" << getRegU32(ctx, 2)
+                      << " v1=0x" << getRegU32(ctx, 3)
+                      << " sp=0x" << getRegU32(ctx, 29)
+                      << std::dec << std::endl;
+        }
         exitThreadWithHandlers(ee.currentThreadId(), ctx, runtime, false);
     }
 

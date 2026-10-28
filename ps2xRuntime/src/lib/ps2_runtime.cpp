@@ -3,6 +3,7 @@
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "game_overrides.h"
+#include "armageddon_hle.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ee_scheduler.h"
@@ -38,6 +39,10 @@ namespace ps2_stubs
 {
     void resetSifState();
 }
+
+// This generated translation belongs to the separately loaded Armageddon
+// GAMER overlay, so it is outside the main ELF's dense function table.
+void gamer_007c4980_0x7c4980(uint8_t *, R5900Context *, PS2Runtime *);
 
 namespace
 {
@@ -672,11 +677,16 @@ ps2x::iop::RpcAbi PS2Runtime::selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &re
 
 bool PS2Runtime::canBindIopRpc(uint32_t sid) const noexcept
 {
+    if (armageddon_hle::canBindRpc(this, sid))
+        return true;
     return m_iopSubsystem->canBindRpc(sid);
 }
 
 ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request)
 {
+    ps2x::iop::RpcResult hleResult = armageddon_hle::handleRpc(this, rdram, request);
+    if (hleResult.handled)
+        return hleResult;
     auto scope = m_iopHost->enterCall(ctx, rdram);
     request.callToken = scope.token();
     return m_iopSubsystem->handleRpc(request);
@@ -1808,6 +1818,11 @@ bool PS2Runtime::hasFunction(uint32_t address) const
 #if defined(PS2X_ARMAGEDDON_RELOCATIONS)
     address = armageddon_relocations::canonical(this, address);
 #endif
+    if (address == 0x007C4980u &&
+        std::getenv("PS2X_ARMAGEDDON_HLE_BOOT") != nullptr)
+    {
+        return true;
+    }
     uint32_t slot = 0u;
     return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
 }
@@ -1837,6 +1852,15 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
     address = armageddon_relocations::canonical(this, address);
 #endif
     pushDispatchPc(address);
+
+    // HLE boot loads the original GAMER overlay through the virtual CD path.
+    // Its initializer is separately recompiled from the byte-validated
+    // overlay analysis ELF and cannot occupy a slot in the main ELF table.
+    if (address == 0x007C4980u &&
+        std::getenv("PS2X_ARMAGEDDON_HLE_BOOT") != nullptr)
+    {
+        return &gamer_007c4980_0x7c4980;
+    }
 
     uint32_t slot = 0u;
     if (generatedFunctionTableSlot(address, slot))
@@ -1891,7 +1915,14 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
                                        GuestBranchKind kind,
                                        const char *debugName)
 {
-    if (m_diagnosticActive && m_diagnosticOutcome.stopReason == "running")
+    const bool discoveryEnabled = std::getenv("PS2X_ARMAGEDDON_DISCOVERY") != nullptr;
+    const bool discoveryCall = discoveryEnabled &&
+                               (kind == GuestBranchKind::DirectCall ||
+                                kind == GuestBranchKind::IndirectCall);
+    const bool discoveryTransfer = discoveryEnabled &&
+                                   (kind == GuestBranchKind::IndirectCall ||
+                                    kind == GuestBranchKind::IndirectJump);
+    if (!discoveryCall && m_diagnosticActive && m_diagnosticOutcome.stopReason == "running")
     {
         diagnosticCapture(ctx);
         m_diagnosticOutcome.context.pc = targetPc;
@@ -1916,6 +1947,83 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     const uint32_t s1 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[17], 0));
     const uint32_t v0 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[2], 0));
     const uint32_t v1 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[3], 0));
+
+    uint32_t indirectInstruction = 0u;
+    uint32_t indirectTargetRegister = 0u;
+    uint32_t pointerDefinitionPc = 0u;
+    uint32_t pointerDefinitionInstruction = 0u;
+    uint32_t pointerLoadAddress = 0u;
+    uint32_t pointerLoadedValue = 0u;
+    bool indirectInstructionReadable = false;
+    bool pointerLoadFound = false;
+    bool pointerLoadValueMatches = false;
+    if ((kind == GuestBranchKind::IndirectCall || kind == GuestBranchKind::IndirectJump) &&
+        rdram != nullptr)
+    {
+        const auto readPhysicalWord = [rdram](uint32_t address, uint32_t &value)
+        {
+            const uint32_t physical = address & 0x1FFFFFFFu;
+            if ((physical & 3u) != 0u || physical > PS2_RAM_SIZE - sizeof(value))
+                return false;
+            std::memcpy(&value, rdram + physical, sizeof(value));
+            return true;
+        };
+        indirectInstructionReadable = readPhysicalWord(sourcePc, indirectInstruction);
+        const uint32_t indirectFunction = indirectInstruction & 0x3Fu;
+        if (indirectInstructionReadable && (indirectInstruction >> 26) == 0u &&
+            (indirectFunction == 0x08u || indirectFunction == 0x09u))
+        {
+            indirectTargetRegister = (indirectInstruction >> 21) & 31u;
+            const uint32_t targetValue = static_cast<uint32_t>(
+                _mm_extract_epi32(ctx->r[indirectTargetRegister], 0));
+            for (uint32_t distance = 1u; distance <= 32u && sourcePc >= distance * 4u; ++distance)
+            {
+                const uint32_t candidatePc = sourcePc - distance * 4u;
+                uint32_t instruction = 0u;
+                if (!readPhysicalWord(candidatePc, instruction))
+                    break;
+                const uint32_t opcode = instruction >> 26;
+                const uint32_t rs = (instruction >> 21) & 31u;
+                const uint32_t rt = (instruction >> 16) & 31u;
+                const uint32_t rd = (instruction >> 11) & 31u;
+                const uint32_t function = instruction & 0x3Fu;
+                const bool integerLoad = (opcode >= 0x20u && opcode <= 0x27u) ||
+                                         opcode == 0x30u || opcode == 0x34u || opcode == 0x37u;
+                const bool writesRt = integerLoad ||
+                                      (opcode >= 0x08u && opcode <= 0x0Fu) ||
+                                      opcode == 0x18u || opcode == 0x19u || opcode == 0x1Au || opcode == 0x1Bu;
+                const bool writesRd = opcode == 0u && function != 0x08u && function != 0x09u &&
+                                      function != 0x0Cu && function != 0x0Du && rd != 0u;
+                if ((integerLoad && rt == indirectTargetRegister) ||
+                    (writesRt && rt == indirectTargetRegister) ||
+                    (writesRd && rd == indirectTargetRegister))
+                {
+                    pointerDefinitionPc = candidatePc;
+                    pointerDefinitionInstruction = instruction;
+                    if (integerLoad)
+                    {
+                        const int32_t displacement = static_cast<int16_t>(instruction & 0xFFFFu);
+                        const uint32_t baseValue = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[rs], 0));
+                        // A load whose base aliases its destination has already
+                        // destroyed the pre-load base value in R5900Context.
+                        // Do not report a fabricated address in that case.
+                        if (rs != indirectTargetRegister)
+                        {
+                            pointerLoadAddress = baseValue + static_cast<uint32_t>(displacement);
+                            pointerLoadFound = readPhysicalWord(pointerLoadAddress, pointerLoadedValue);
+                            pointerLoadValueMatches = pointerLoadFound && pointerLoadedValue == targetValue;
+                        }
+                    }
+                    break;
+                }
+                // Do not walk through a control-flow boundary while seeking a
+                // register definition; this is a bounded static provenance hint.
+                if ((opcode >= 0x01u && opcode <= 0x07u) ||
+                    (opcode == 0u && (function == 0x08u || function == 0x09u)))
+                    break;
+            }
+        }
+    }
 
     auto readGuestU32At = [rdram](uint32_t addr, uint32_t &out) -> bool
     {
@@ -1983,7 +2091,9 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
         readGuestU32Offset(a0Word0, 0x08u, vtableSlot8) &&
         readGuestU32Offset(a0Word0, 0x0cu, vtableSlotC);
 
-    if (firstReport)
+    // Discovery runs need a record for every distinct transfer occurrence;
+    // the ordinary strict/debug modes retain the one-time diagnostic behavior.
+    if (firstReport || discoveryTransfer || (discoveryEnabled && kind == GuestBranchKind::DirectCall))
     {
         std::ostringstream oss;
         oss << "[guest-branch:missing-target] kind=" << describeGuestBranchKind(kind)
@@ -2023,6 +2133,25 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
             << " vtbl[8]=0x" << vtableSlot8
             << " vtbl[c]=0x" << vtableSlotC
             << " codeRegion=" << (m_memory.isCodeAddress(targetPc) ? "yes" : "no")
+            << " load=" << (m_memory.isCodeAddress(targetPc) ? "main-elf" : "unclassified")
+            << " discovery=" << (discoveryEnabled && kind == GuestBranchKind::DirectCall
+                                      ? "skip-direct-call-no-callee-side-effects"
+                                      : discoveryTransfer
+                                            ? (kind == GuestBranchKind::IndirectCall
+                                                   ? "skip-indirect-call-no-callee-side-effects"
+                                                   : "logged-indirect-jump")
+                                            : "off")
+            << " indirect_instruction=" << (indirectInstructionReadable ? "0x" : "unreadable")
+            << (indirectInstructionReadable ? indirectInstruction : 0u)
+            << " target_reg=$r" << indirectTargetRegister
+            << " pointer_def_pc=" << (pointerDefinitionPc ? "0x" : "none")
+            << (pointerDefinitionPc ? pointerDefinitionPc : 0u)
+            << " pointer_def_instruction=0x" << pointerDefinitionInstruction
+            << " pointer_load_address=" << (pointerLoadFound ? "0x" : "unknown")
+            << (pointerLoadFound ? pointerLoadAddress : 0u)
+            << " pointer_loaded_value=" << (pointerLoadFound ? "0x" : "unknown")
+            << (pointerLoadFound ? pointerLoadedValue : 0u)
+            << " pointer_load_matches_target=" << (pointerLoadValueMatches ? "yes" : "no")
             << " policy=" << static_cast<uint32_t>(policy)
             << " trace=" << formatDispatchHistory()
             << std::dec;
@@ -2046,7 +2175,7 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
         ctx->pc = targetPc;
     }
 
-    if (policy == MissingFunctionPolicy::Stop)
+    if (policy == MissingFunctionPolicy::Stop && !discoveryCall)
     {
         requestStop();
     }
@@ -2065,6 +2194,30 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 #endif
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+    const bool traceArmageddonStdioGuard =
+        std::getenv("PS2X_ARMAGEDDON_HLE_TRACE_STDIO") != nullptr && targetPc == 0x001119F8u;
+    static uint32_t armageddonStdioGuardCount = 0u;
+    if (traceArmageddonStdioGuard && armageddonStdioGuardCount < 16u)
+    {
+        ++armageddonStdioGuardCount;
+        const auto readTraceWord = [rdram](uint32_t address)
+        {
+            uint32_t value = 0u;
+            if (rdram != nullptr && address <= PS2_RAM_SIZE - sizeof(value))
+                std::memcpy(&value, rdram + address, sizeof(value));
+            return value;
+        };
+        std::cerr << "[Armageddon HLE SceStdio guard] count=" << std::dec << armageddonStdioGuardCount
+                  << " source=0x" << std::hex << sourcePc
+                  << " global_6535e8=0x" << readTraceWord(0x006535E8u)
+                  << " embedded_59810c=0x" << readTraceWord(0x0059810Cu)
+                  << " embedded_5981d0=0x" << readTraceWord(0x005981D0u)
+                  << " response_652b00=0x" << readTraceWord(0x00652B00u)
+                  << " response_652b04=0x" << readTraceWord(0x00652B04u)
+                  << " a0=0x" << GPR_U32(ctx, 4) << " a1=0x" << GPR_U32(ctx, 5)
+                  << " a2=0x" << GPR_U32(ctx, 6) << " a3=0x" << GPR_U32(ctx, 7)
+                  << std::dec << std::endl;
+    }
     const bool traceSifCallbackDispatch =
         std::getenv("PS2X_SIF_TRACE_DATA") != nullptr && targetPc == 0x0010F5C8u;
     static uint64_t sifSetSregDispatchCount = 0u;
@@ -2078,6 +2231,122 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                   << " a0=0x" << GPR_U32(ctx, 4)
                   << " a1=0x" << GPR_U32(ctx, 5)
                   << " gp=0x" << GPR_U32(ctx, 28) << std::dec << std::endl;
+    }
+
+    // Attribute the Armageddon VIF/GIF queue wait to its guest call sites.
+    // This is observation only; it does not alter dispatch or guest state.
+    static uint32_t armageddonVifQueueCallCount = 0u;
+    if (std::getenv("PS2X_ARMAGEDDON_RENDER_WAIT_TRACE") != nullptr &&
+        (targetPc == 0x001AD520u || targetPc == 0x001ACA60u) &&
+        armageddonVifQueueCallCount < 64u)
+    {
+        ++armageddonVifQueueCallCount;
+        const uint32_t gp = GPR_U32(ctx, 28);
+        const auto readQueueWord = [rdram](uint32_t address)
+        {
+            uint32_t value = 0u;
+            const uint32_t physical = address & 0x1FFFFFFFu;
+            if (rdram != nullptr && physical <= PS2_RAM_SIZE - sizeof(value))
+                std::memcpy(&value, rdram + physical, sizeof(value));
+            return value;
+        };
+        std::cerr << "[Armageddon HLE VIF queue call] count=" << armageddonVifQueueCallCount
+                  << " source=0x" << std::hex << sourcePc
+                  << " target=0x" << targetPc
+                  << " caller_exec=0x" << callerExecPc
+                  << " ra=0x" << GPR_U32(ctx, 31)
+                  << " gp=0x" << gp
+                  << " state_a=0x" << readQueueWord(gp - 0x5BB0u)
+                  << " state_b=0x" << readQueueWord(gp - 0x5BACu)
+                  << " queue_status=0x" << readQueueWord(gp - 0x5B9Cu)
+                  << " callback_gate=0x" << readQueueWord(gp - 0x5BF0u);
+        const uint32_t stateB = readQueueWord(gp - 0x5BACu);
+        if (stateB != 0u)
+        {
+            std::cerr << " queue_record=" << readQueueWord(stateB)
+                      << ",0x" << readQueueWord(stateB + 4u)
+                      << ",0x" << readQueueWord(stateB + 8u)
+                      << ",0x" << readQueueWord(stateB + 12u);
+        }
+        std::cerr << std::dec << std::endl;
+    }
+
+    // The HLE discovery run reaches Armageddon's render/swap callback wait at
+    // FUN_001ad520. Capture the actual callback target and the guest globals
+    // used by its bVar2/bVar3 loop; this is diagnostic only and changes no
+    // scheduling or register state.
+    static uint64_t armageddonRenderCallbackCount = 0u;
+    if (std::getenv("PS2X_ARMAGEDDON_RENDER_WAIT_TRACE") != nullptr &&
+        sourcePc == 0x001AD628u && isCall && armageddonRenderCallbackCount < 256u)
+    {
+        ++armageddonRenderCallbackCount;
+        const uint32_t gp = GPR_U32(ctx, 28);
+        const auto readRenderWaitWord = [rdram](uint32_t address)
+        {
+            uint32_t value = 0u;
+            const uint32_t physical = address & 0x1FFFFFFFu;
+            if (rdram != nullptr && physical <= PS2_RAM_SIZE - sizeof(value))
+                std::memcpy(&value, rdram + physical, sizeof(value));
+            return value;
+        };
+        const uint32_t callbackSlot = gp - 0x5BF4u;
+        const uint32_t stateA = gp - 0x5BB0u;
+        const uint32_t stateB = gp - 0x5BACu;
+        const uint32_t statusByte = gp - 0x5B9Cu;
+        const uint32_t callbackGate = gp - 0x5BF0u;
+        const uint32_t alternateStatusByte = gp - 0x5BA0u;
+        const uint32_t queueRead = readRenderWaitWord(stateA);
+        const uint32_t queueWrite = readRenderWaitWord(stateB);
+        std::cerr << "[Armageddon HLE render-wait callback] count=" << armageddonRenderCallbackCount
+                  << " source=0x" << std::hex << sourcePc
+                  << " target=0x" << targetPc
+                  << " callback_slot=0x" << callbackSlot
+                  << " callback_value=0x" << readRenderWaitWord(callbackSlot)
+                  << " state_a_addr=0x" << stateA << " state_a=0x" << readRenderWaitWord(stateA)
+                  << " state_b_addr=0x" << stateB << " state_b=0x" << readRenderWaitWord(stateB)
+                  << " status_addr=0x" << statusByte << " status_word=0x" << readRenderWaitWord(statusByte)
+                  << " callback_gate_addr=0x" << callbackGate << " callback_gate=0x" << readRenderWaitWord(callbackGate)
+                  << " alternate_status=0x" << readRenderWaitWord(alternateStatusByte)
+                  << " vif1_chcr=0x" << m_memory.readIORegister(0x10009000u)
+                  << " vif1_madr=0x" << m_memory.readIORegister(0x10009010u)
+                  << " vif1_qwc=0x" << m_memory.readIORegister(0x10009020u)
+                  << " vif1_tadr=0x" << m_memory.readIORegister(0x10009030u)
+                  << " vif1_stat=0x" << m_memory.readIORegister(0x10003C00u)
+                  << " gif_chcr=0x" << m_memory.readIORegister(0x1000A000u)
+                  << " gif_madr=0x" << m_memory.readIORegister(0x1000A010u)
+                  << " gif_qwc=0x" << m_memory.readIORegister(0x1000A020u)
+                  << " gif_tadr=0x" << m_memory.readIORegister(0x1000A030u)
+                  << " gif_stat=0x" << m_memory.readIORegister(0x10003020u)
+                  << " d_stat=0x" << m_memory.readIORegister(0x1000E010u)
+                  << " d_ctrl=0x" << m_memory.readIORegister(0x1000E000u)
+                  << " cop0_status=0x" << ctx->cop0_status
+                  << " a0=0x" << GPR_U32(ctx, 4) << " a1=0x" << GPR_U32(ctx, 5)
+                  << " s0=0x" << GPR_U32(ctx, 16) << " s1=0x" << GPR_U32(ctx, 17)
+                  << " gp=0x" << gp << std::dec << std::endl;
+        if (queueRead <= queueWrite && queueWrite - queueRead <= 0x1000u)
+        {
+            const uint32_t entries = std::min<uint32_t>((queueWrite - queueRead) / 16u, 4u);
+            for (uint32_t entry = 0; entry < entries; ++entry)
+            {
+                const uint32_t address = queueRead + entry * 16u;
+                std::cerr << "[Armageddon HLE render-wait queue] index=" << entry
+                          << " address=0x" << std::hex << address
+                          << " w0=0x" << readRenderWaitWord(address)
+                          << " w1=0x" << readRenderWaitWord(address + 4u)
+                          << " w2=0x" << readRenderWaitWord(address + 8u)
+                          << " w3=0x" << readRenderWaitWord(address + 12u)
+                          << std::dec << std::endl;
+            }
+        }
+        for (uint32_t pointerValue : {queueRead, queueWrite})
+        {
+            std::cerr << "[Armageddon HLE render-wait queue-pointer] pointer=0x" << std::hex << pointerValue
+                      << " w0=0x" << readRenderWaitWord(pointerValue)
+                      << " w1=0x" << readRenderWaitWord(pointerValue + 4u)
+                      << " w2=0x" << readRenderWaitWord(pointerValue + 8u)
+                      << " w3=0x" << readRenderWaitWord(pointerValue + 12u)
+                      << std::dec << std::endl;
+        }
     }
 
     // The game's SIF command dispatcher reaches its registered command
@@ -2148,6 +2417,12 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     const bool startupFlowTraceRequested = std::getenv("PS2X_EE_STARTUP_FLOW_TRACE") != nullptr;
     const bool startupFlowCallSite =
         (sourcePc >= 0x00122740u && sourcePc < 0x00122AB8u) ||
+        (sourcePc >= 0x00126420u && sourcePc < 0x00126710u) ||
+        (sourcePc >= 0x00127260u && sourcePc < 0x00127364u) ||
+        (sourcePc >= 0x001A0000u && sourcePc < 0x001A8000u) ||
+        (sourcePc >= 0x001B7000u && sourcePc < 0x001B8000u) ||
+        (sourcePc >= 0x00429810u && sourcePc < 0x00429A90u) ||
+        (sourcePc >= 0x00429D20u && sourcePc < 0x00429D80u) ||
         (sourcePc >= 0x00294520u && sourcePc < 0x002947B8u);
     static uint32_t startupFlowTraceCount = 0u;
     const bool traceStartupFlow = startupFlowTraceRequested && startupFlowCallSite &&
@@ -2211,7 +2486,49 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     if (!hasFunction(targetPc))
     {
+        const bool discoveryEnabled = std::getenv("PS2X_ARMAGEDDON_DISCOVERY") != nullptr;
+        const bool discoverUnresolvedCall = discoveryEnabled && isCall;
+        const bool discoverIndirectTransfer =
+            discoveryEnabled &&
+            (kind == GuestBranchKind::IndirectCall || kind == GuestBranchKind::IndirectJump);
         reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
+
+        if (discoverUnresolvedCall && kind == GuestBranchKind::DirectCall)
+        {
+            // Discovery only: continue at the call's architectural return
+            // point while explicitly recording that the callee did not run.
+            std::cerr << "[guest-branch:discovery-call-skipped] source=0x" << std::hex
+                      << sourcePc << " target=0x" << targetPc
+                      << " kind=direct-call callee_side_effects=omitted" << std::dec << std::endl;
+            ctx->pc = fallthroughPc;
+            return true;
+        }
+
+        if (discoverIndirectTransfer && kind == GuestBranchKind::IndirectCall)
+        {
+            // A JALR call has a known architectural continuation after its
+            // delay slot. Discovery records that callee side effects are omitted.
+            std::cerr << "[guest-branch:discovery-call-skipped] source=0x" << std::hex
+                      << sourcePc << " target=0x" << targetPc
+                      << " kind=indirect-call callee_side_effects=omitted" << std::dec << std::endl;
+            ctx->pc = fallthroughPc;
+            return true;
+        }
+
+        if (discoverIndirectTransfer && kind == GuestBranchKind::IndirectJump &&
+            targetPc == fallthroughPc && m_memory.isCodeAddress(targetPc))
+        {
+            // JR/JALR delay-slot execution has completed before this dispatch.
+            // If its target is exactly the sequential continuation, letting
+            // the scheduler resume there is behaviorally equivalent to the
+            // generated fallthrough path and is safe for discovery.
+            std::cerr << "[guest-branch:discovery-fallthrough] source=0x" << std::hex
+                      << sourcePc << " target=0x" << targetPc
+                      << " classification=executable-fallthrough-continuation" << std::dec
+                      << std::endl;
+            ctx->pc = fallthroughPc;
+            return true;
+        }
 
         const MissingFunctionPolicy policy = missingFunctionPolicy();
 
@@ -2245,8 +2562,46 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     RecompiledFunction targetFn = lookupFunction(targetPc);
 #endif
     const uint32_t entryPc = ctx->pc;
+    static uint32_t armageddonOverlayFlowCount = 0u;
+    const bool traceArmageddonOverlayFlow =
+        std::getenv("PS2X_HLE_OVERLAY_FLOW_TRACE") != nullptr &&
+        (targetPc == 0x001120F8u || targetPc == 0x00111158u ||
+         targetPc == 0x001100F0u || targetPc == 0x00112338u ||
+         targetPc == 0x003342E0u || targetPc == 0x003DDA70u ||
+         targetPc == 0x003DDB74u || targetPc == 0x00111CF0u ||
+         targetPc == 0x0010C820u || targetPc == 0x0010C800u ||
+         targetPc == 0x0010C7F0u || targetPc == 0x0010C7E0u ||
+         targetPc == 0x0010FE78u) &&
+        armageddonOverlayFlowCount < 256u;
+    if (traceArmageddonOverlayFlow)
+    {
+        ++armageddonOverlayFlowCount;
+        const GuestThread *owner = m_eeScheduler ? m_eeScheduler->currentThread() : nullptr;
+        std::cerr << "[Armageddon HLE overlay flow entry] n=" << std::dec << armageddonOverlayFlowCount
+                  << " thread=" << (owner ? owner->id : 0)
+                  << " source=0x" << std::hex << sourcePc << " target=0x" << targetPc
+                  << " ra=0x" << GPR_U32(ctx, 31)
+                  << " a0=0x" << GPR_U32(ctx, 4) << " a1=0x" << GPR_U32(ctx, 5)
+                  << " a2=0x" << GPR_U32(ctx, 6) << " a3=0x" << GPR_U32(ctx, 7)
+                  << " t0=0x" << GPR_U32(ctx, 8) << " t1=0x" << GPR_U32(ctx, 9)
+                  << " t2=0x" << GPR_U32(ctx, 10) << " t3=0x" << GPR_U32(ctx, 11)
+                  << " s0=0x" << GPR_U32(ctx, 16) << " s1=0x" << GPR_U32(ctx, 17)
+                  << " s2=0x" << GPR_U32(ctx, 18) << " s3=0x" << GPR_U32(ctx, 19)
+                  << " gp=0x" << GPR_U32(ctx, 28) << " sp=0x" << GPR_U32(ctx, 29)
+                  << " v0=0x" << GPR_U32(ctx, 2) << std::dec << std::endl;
+    }
     diagnosticGuestDispatch(ctx);
     targetFn(rdram, ctx, this);
+
+    if (traceArmageddonOverlayFlow)
+    {
+        std::cerr << "[Armageddon HLE overlay flow return] n=" << std::dec << armageddonOverlayFlowCount
+                  << " target=0x" << std::hex << targetPc << " next_pc=0x" << ctx->pc
+                  << " v0=0x" << GPR_U32(ctx, 2) << " v1=0x" << GPR_U32(ctx, 3)
+                  << " s0=0x" << GPR_U32(ctx, 16) << " s1=0x" << GPR_U32(ctx, 17)
+                  << " s2=0x" << GPR_U32(ctx, 18) << " s3=0x" << GPR_U32(ctx, 19)
+                  << " sp=0x" << GPR_U32(ctx, 29) << std::dec << std::endl;
+    }
 
     if (traceStartupFlow)
     {
@@ -2407,6 +2762,26 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
     for (uint32_t cause : m_memory.consumeCompletedDmacCauses())
     {
         ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
+    }
+
+    // GS SIGNAL/FINISH status is reflected in CSR by the GIF path. The EE sees
+    // these as INTC cause 0 when the matching GS IMR bit is clear. Dispatch at
+    // the transfer-drain boundary so the guest observes the CSR update before
+    // its interrupt handler runs.
+    const uint64_t csr = m_memory.gs().csr.load(std::memory_order_acquire);
+    const uint64_t imr = m_memory.gs().imr;
+    const bool signalPending = (csr & 0x1u) != 0u && (imr & (1ull << 8u)) == 0u;
+    const bool finishPending = (csr & 0x2u) != 0u && (imr & (1ull << 9u)) == 0u;
+    if ((signalPending || finishPending) && m_eeScheduler)
+    {
+        const char *trace = std::getenv("PS2X_EE_IRQ_TRACE");
+        if (trace && trace[0] != '\0' && trace[0] != '0')
+        {
+            std::cerr << "[EE_GS_IRQ_SOURCE] cause=0 signal=" << (signalPending ? 1 : 0)
+                      << " finish=" << (finishPending ? 1 : 0)
+                      << " csr=0x" << std::hex << csr << " imr=0x" << imr << std::dec << '\n';
+        }
+        m_eeScheduler->dispatchIrq(false, 0u);
     }
 }
 
@@ -3026,10 +3401,50 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value)
 {
     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
+    const uint32_t physicalAddress = vaddr & 0x1FFFFFFFu;
+    const bool armageddonDmaProgramTrace =
+        std::getenv("PS2X_ARMAGEDDON_DMA_PROGRAM_TRACE") != nullptr &&
+        (physicalAddress == 0x10009000u || physicalAddress == 0x10009010u ||
+         physicalAddress == 0x10009020u || physicalAddress == 0x10009030u ||
+         physicalAddress == 0x1000A000u || physicalAddress == 0x1000A010u ||
+         physicalAddress == 0x1000A020u || physicalAddress == 0x1000A030u);
+    static uint32_t armageddonDmaProgramTraceCount = 0u;
+    const bool traceArmageddonDmaProgram = armageddonDmaProgramTrace && armageddonDmaProgramTraceCount < 512u;
+    if (traceArmageddonDmaProgram)
+    {
+        ++armageddonDmaProgramTraceCount;
+        std::cerr << "[Armageddon DMA program] phase=before count=" << armageddonDmaProgramTraceCount
+                  << " pc=0x" << std::hex << (ctx ? ctx->pc : 0u)
+                  << " address=0x" << physicalAddress << " value=0x" << value;
+        for (uint32_t base : {0x10009000u, 0x1000A000u})
+        {
+            std::cerr << " ch" << (base == 0x10009000u ? "_vif1" : "_gif")
+                      << "_chcr=0x" << m_memory.readIORegister(base)
+                      << "_madr=0x" << m_memory.readIORegister(base + 0x10u)
+                      << "_qwc=0x" << m_memory.readIORegister(base + 0x20u)
+                      << "_tadr=0x" << m_memory.readIORegister(base + 0x30u);
+        }
+        std::cerr << std::dec << std::endl;
+    }
     try
     {
         m_memory.write32(vaddr, value);
         drainCompletedDmacHandlers(rdram);
+        if (traceArmageddonDmaProgram)
+        {
+            std::cerr << "[Armageddon DMA program] phase=after count=" << armageddonDmaProgramTraceCount
+                      << " pc=0x" << std::hex << (ctx ? ctx->pc : 0u)
+                      << " address=0x" << physicalAddress << " value=0x" << value;
+            for (uint32_t base : {0x10009000u, 0x1000A000u})
+            {
+                std::cerr << " ch" << (base == 0x10009000u ? "_vif1" : "_gif")
+                          << "_chcr=0x" << m_memory.readIORegister(base)
+                          << "_madr=0x" << m_memory.readIORegister(base + 0x10u)
+                          << "_qwc=0x" << m_memory.readIORegister(base + 0x20u)
+                          << "_tadr=0x" << m_memory.readIORegister(base + 0x30u);
+            }
+            std::cerr << " d_stat=0x" << m_memory.readIORegister(0x1000E010u) << std::dec << std::endl;
+        }
     }
     catch (const std::exception &)
     {
@@ -3322,6 +3737,14 @@ void PS2Runtime::run()
         gameThreadFinished.store(true, std::memory_order_release); });
 
     uint64_t tick = 0;
+    const char *const screenshotBaseEnv = std::getenv("PS2X_CAPTURE_SCREENSHOT");
+    const std::filesystem::path screenshotBase =
+        screenshotBaseEnv && screenshotBaseEnv[0] != '\0'
+            ? std::filesystem::path(screenshotBaseEnv)
+            : std::filesystem::path{};
+    const auto screenshotStart = std::chrono::steady_clock::now();
+    auto nextScreenshotAt = screenshotStart + std::chrono::seconds(10);
+    uint32_t screenshotIndex = 0u;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         PS2_IF_AGRESSIVE_LOGS({
@@ -3338,6 +3761,39 @@ void PS2Runtime::run()
                 const uint32_t dbgSp = m_debugSp.load(std::memory_order_relaxed);
                 const uint32_t dbgGp = m_debugGp.load(std::memory_order_relaxed);
                 const auto eeSnapshot = m_eeScheduler->snapshot();
+
+                static uint32_t eeThreadTraceSnapshots = 0u;
+                if (std::getenv("PS2X_EE_THREAD_TRACE") != nullptr &&
+                    eeThreadTraceSnapshots < 256u)
+                {
+                    ++eeThreadTraceSnapshots;
+                    RUNTIME_LOG("[EE_THREAD_SNAPSHOT] tick=" << tick
+                                                               << " running=" << eeSnapshot.runningThreadId
+                                                               << " cycle=" << eeSnapshot.eeCycle);
+                    for (const auto &thread : eeSnapshot.threads)
+                    {
+                        RUNTIME_LOG("[EE_THREAD_STATE] id=" << thread.id
+                                                             << " status=" << static_cast<unsigned>(thread.status)
+                                                             << " wait_reason=" << static_cast<unsigned>(thread.waitReason)
+                                                             << " wait_id=" << thread.waitId
+                                                             << " priority=" << thread.currentPriority
+                                                             << " pc=0x" << std::hex << thread.pc
+                                                             << " ra=0x" << thread.ra
+                                                             << " entry=0x" << thread.entry
+                                                             << std::dec
+                                                             << " invocation_depth=" << thread.invocationDepth);
+                    }
+                    for (const auto &semaphore : eeSnapshot.semaphores)
+                    {
+                        if (semaphore.waiters != 0u || semaphore.count != 0)
+                        {
+                            RUNTIME_LOG("[EE_SEMAPHORE_STATE] id=" << semaphore.id
+                                                                   << " count=" << semaphore.count
+                                                                   << " max=" << semaphore.maxCount
+                                                                   << " waiters=" << semaphore.waiters);
+                        }
+                    }
+                }
 
                 RUNTIME_LOG("[run:tick] tick=" << tick
                                                << " pc=0x" << std::hex << dbgPc
@@ -3379,6 +3835,24 @@ void PS2Runtime::run()
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
+        }
+        const auto screenshotNow = std::chrono::steady_clock::now();
+        if (!screenshotBase.empty() && screenshotNow >= nextScreenshotAt)
+        {
+            ++screenshotIndex;
+            const auto elapsedSeconds =
+                std::chrono::duration_cast<std::chrono::seconds>(screenshotNow - screenshotStart).count();
+            const std::string screenshotName = screenshotBase.stem().string() + "_" +
+                                               std::to_string(elapsedSeconds) + "s_" +
+                                               std::to_string(screenshotIndex) + screenshotBase.extension().string();
+            const std::filesystem::path screenshotPath = screenshotBase.parent_path() / screenshotName;
+            // Raylib 5.5 writes screenshots to the process working directory;
+            // pass a basename and let the run launch from the capture folder.
+            TakeScreenshot(screenshotName.c_str());
+            std::cout << "[Armageddon visible capture] elapsed_seconds=" << elapsedSeconds
+                      << " index=" << screenshotIndex
+                      << " path=" << (std::filesystem::current_path() / screenshotName).string() << std::endl;
+            nextScreenshotAt += std::chrono::seconds(10);
         }
         EndDrawing();
 

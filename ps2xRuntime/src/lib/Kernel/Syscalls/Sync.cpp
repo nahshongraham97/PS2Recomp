@@ -14,6 +14,7 @@ namespace ps2_syscalls
         constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
         constexpr uint32_t WEF_MODE_MASK = WEF_OR | WEF_CLEAR | WEF_CLEAR_ALL;
         constexpr uint32_t EA_MULTI = 0x02u;
+        uint32_t g_prioritySemaTraceRecords = 0u;
 
         bool shouldTraceSema(int id)
         {
@@ -21,6 +22,11 @@ namespace ps2_syscalls
             if (!enabled || enabled[0] == '\0' || enabled[0] == '0')
             {
                 return false;
+            }
+            if ((id == 3 || id == 25) && g_prioritySemaTraceRecords < 2048u)
+            {
+                ++g_prioritySemaTraceRecords;
+                return true;
             }
             static uint32_t records = 0;
             if (records >= 256)

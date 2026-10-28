@@ -123,6 +123,37 @@ if(BUILD_TESTING)
         ${CMAKE_SOURCE_DIR}/ps2xIOP/include
     )
     target_link_libraries(ps2x_runtime_kernel_tests PRIVATE ps2_runtime ps2_iop)
+
+    # The Armageddon runtime invokes this overlay entry during startup. When
+    # the game-specific supplemental source list is configured, link that
+    # real translation into the kernel test executable as well; avoid a test
+    # stub that would hide a registration/linkage regression.
+    foreach(supplemental_source IN LISTS PS2X_ARMAGEDDON_SUPPLEMENTAL_FUNCTION_SOURCES)
+        get_filename_component(supplemental_name "${supplemental_source}" NAME)
+        if(supplemental_name STREQUAL "gamer_007c4980_0x7c4980.cpp")
+            get_filename_component(supplemental_dir "${supplemental_source}" DIRECTORY)
+            target_sources(ps2x_runtime_kernel_tests PRIVATE "${supplemental_source}")
+            target_sources(ps2x_tests PRIVATE "${supplemental_source}")
+            target_sources(ps2x_sif_tests PRIVATE "${supplemental_source}")
+            target_include_directories(ps2x_runtime_kernel_tests PRIVATE
+                "${supplemental_dir}"
+                "${PS2X_ARMAGEDDON_GENERATED_SOURCE_DIR}"
+                "${CMAKE_SOURCE_DIR}/ps2xRuntime/include"
+                "${CMAKE_SOURCE_DIR}/ps2xIOP/include"
+            )
+            foreach(test_target IN ITEMS ps2x_tests ps2x_sif_tests)
+                target_include_directories(${test_target} PRIVATE
+                    "${supplemental_dir}"
+                    "${PS2X_ARMAGEDDON_GENERATED_SOURCE_DIR}"
+                    "${CMAKE_SOURCE_DIR}/ps2xIOP/include"
+                )
+            endforeach()
+            set_source_files_properties("${supplemental_source}" PROPERTIES
+                SKIP_UNITY_BUILD_INCLUSION TRUE
+                SKIP_PRECOMPILE_HEADERS TRUE
+            )
+        endif()
+    endforeach()
     add_test(NAME ps2x_runtime_kernel_tests COMMAND ps2x_runtime_kernel_tests)
 endif()
 

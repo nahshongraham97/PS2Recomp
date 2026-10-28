@@ -7,6 +7,7 @@
 #include <limits>
 #include <stdexcept>
 #include <algorithm>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -1124,6 +1125,14 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    // Internal hardware-event input. Guest MMIO stores reach the physical
+    // register addresses below; only the scheduler calls this sentinel.
+    // Keep hardware raising separate from guest W1C acknowledgement.
+    if (address == 0xFFFFFFFCu)
+    {
+        m_ioRegisters[0x1000F000u] |= value & 0x7FFFu;
+        return true;
+    }
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
@@ -1213,6 +1222,24 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         if ((status & mask) != 0u)
             next |= (1u << 31);
         m_ioRegisters[address] = next;
+        return true;
+    }
+
+    if (address == 0x1000F010u)
+    {
+        // INTC_MASK is a write-one-to-reverse register. A zero write leaves
+        // each bit unchanged; a one toggles it. PS2Tek and PCSX2's hardware
+        // write path both describe/model this behavior.
+        const uint32_t current = m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
+        m_ioRegisters[address] = current ^ (value & 0x7FFFu);
+        return true;
+    }
+
+    if (address == 0x1000F000u)
+    {
+        // INTC_STAT acknowledges pending causes by writing one to clear.
+        const uint32_t current = m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u;
+        m_ioRegisters[address] = current & ~(value & 0x7FFFu);
         return true;
     }
 
@@ -1404,6 +1431,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                     int tagsProcessed = 0;
                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
+                    uint32_t lastTagId = 0u;
+                    uint32_t lastTagQwc = 0u;
+                    bool lastTagIrq = false;
 
                     while (tagsProcessed < kMaxChainTags)
                     {
@@ -1441,6 +1471,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
                         lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
                         ++tagsProcessed;
+                        lastTagId = id;
+                        lastTagQwc = tagQwc;
+                        lastTagIrq = irq;
 
                         uint32_t dataAddr = 0;
                         bool hasPayload = (tagQwc > 0);
@@ -1515,10 +1548,64 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                         if (hasPayload)
                             appendData(dataAddr, tagQwc);
+                        if (std::getenv("PS2X_ARMAGEDDON_DMA_CHAIN_TRACE") != nullptr &&
+                            channelBase == 0x10009000u && tagsProcessed <= 16)
+                        {
+                            std::cerr << "[Armageddon DMA tag] channel=VIF1 index=" << tagsProcessed
+                                      << " tag_addr=0x" << std::hex << currentTagAddr
+                                      << " raw=0x" << tag
+                                      << " id=" << std::dec << id << " qwc=" << tagQwc
+                                      << " irq=" << (irq ? "true" : "false")
+                                      << " addr=0x" << std::hex << addr
+                                      << " data_addr=0x" << dataAddr;
+                            if (hasPayload)
+                            {
+                                try
+                                {
+                                    const uint32_t dataPhys = translateAddress(dataAddr);
+                                    const bool dataScratch = isScratchpad(dataAddr);
+                                    const uint8_t *dataBase = dataScratch ? m_scratchpad : m_rdram;
+                                    const uint32_t dataLimit = dataScratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+                                    if (dataPhys + 16u <= dataLimit)
+                                    {
+                                        for (uint32_t word = 0u; word < 4u; ++word)
+                                            std::cerr << " data" << word << "=0x"
+                                                      << loadScalar<uint32_t>(dataBase, dataPhys + word * 4u,
+                                                                              dataLimit, "DMA trace", dataAddr);
+                                    }
+                                }
+                                catch (const std::exception &)
+                                {
+                                    std::cerr << " data=<unmapped>";
+                                }
+                            }
+                            std::cerr << std::dec << std::endl;
+                        }
                         if (irq && tieEnabled)
                             endChain = true;
                         if (endChain)
                             break;
+                    }
+
+                    static uint32_t armageddonDmaChainTraceCount = 0u;
+                    if (std::getenv("PS2X_ARMAGEDDON_DMA_CHAIN_TRACE") != nullptr &&
+                        (channelBase == 0x10009000u || channelBase == 0x1000A000u) &&
+                        armageddonDmaChainTraceCount < 128u)
+                    {
+                        ++armageddonDmaChainTraceCount;
+                        std::cerr << "[Armageddon DMA chain] count=" << armageddonDmaChainTraceCount
+                                  << " channel=0x" << std::hex << channelBase
+                                  << " chcr=0x" << value
+                                  << " initial_tadr=0x" << m_ioRegisters[channelBase + 0x30]
+                                  << " final_tadr=0x" << tagAddr
+                                  << " tags=" << std::dec << tagsProcessed
+                                  << " tag_limit_reached=" << (tagsProcessed >= kMaxChainTags ? "true" : "false")
+                                  << " final_tag_id=" << lastTagId
+                                  << " final_tag_qwc=" << lastTagQwc
+                                  << " final_tag_irq=" << (lastTagIrq ? "true" : "false")
+                                  << " payload_bytes=" << chainBuf.size()
+                                  << " end_status=" << ((m_ioRegisters[channelBase + 0x00] & 0x100u) ? "started" : "cleared")
+                                  << std::dec << std::endl;
                     }
 
                     m_ioRegisters[channelBase + 0x30] = tagAddr;

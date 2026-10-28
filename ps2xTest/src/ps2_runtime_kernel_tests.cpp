@@ -608,6 +608,33 @@ void register_ps2_runtime_kernel_tests()
 {
     MiniTest::Case("PS2RuntimeKernel", [](TestCase &tc)
     {
+        tc.Run("startup syscall census entries have explicit handlers", [](TestCase &t)
+        {
+            TestEnv env;
+            constexpr std::array<uint32_t, 4> outputs{0x3000u, 0x3004u, 0x3008u, 0x300Cu};
+            for (size_t i = 0; i < outputs.size(); ++i)
+            {
+                writeGuestU32(env.rdram.data(), outputs[i], 0xA5A50000u + static_cast<uint32_t>(i));
+                setRegU32(env.ctx, 5 + static_cast<int>(i), outputs[i]);
+            }
+            setRegU32(env.ctx, 4, 0u); // default GS mode
+            t.IsTrue(callSyscall(0x80u, env.rdram.data(), &env.ctx, &env.runtime),
+                     "_GetGsDxDyOffset must be recognized by the numeric dispatcher");
+            for (const uint32_t output : outputs)
+            {
+                t.Equals(readGuestU32(env.rdram.data(), output), 0u,
+                         "host-window HLE must initialize each display-offset output");
+            }
+
+            setRegU32(env.ctx, 4, 2u); // handler slot
+            setRegU32(env.ctx, 5, 0x00123400u);
+            t.IsTrue(callSyscall(0x0Du, env.rdram.data(), &env.ctx, &env.runtime),
+                     "SetVTLBRefillHandler must be recognized by the numeric dispatcher");
+
+            t.IsTrue(callSyscall(0x6Bu, env.rdram.data(), &env.ctx, &env.runtime),
+                     "sceSifStopDma must be recognized by the numeric dispatcher");
+        });
+
         tc.Run("unsigned loads and ABI word writes extend independently", [](TestCase &t)
         {
             constexpr uint64_t kUpper = 0x1122334455667788ull;

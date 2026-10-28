@@ -268,6 +268,12 @@ namespace ps2_syscalls
             event.flags = kSifRpcDebugFlagMissingClient;
             event.result = -1;
             pushSifRpcDebugEvent(event);
+            std::cout << "[RPC_SERVICE_EVENT] phase=bind sid=0x" << std::hex << rpcId
+                      << " pc=0x" << (ctx ? ctx->pc : 0u)
+                      << " ra=0x" << (ctx ? getRegU32(ctx, 31) : 0u)
+                      << " client=0x" << clientPtr << " mode=0x" << mode
+                      << " reply_size=0x40 result=invalid-client provider=none"
+                      << std::dec << std::endl;
             setReturnS32(ctx, -1);
             return;
         }
@@ -336,6 +342,13 @@ namespace ps2_syscalls
         event.mode = mode;
         event.result = 0;
         pushSifRpcDebugEvent(event);
+        std::cout << "[RPC_SERVICE_EVENT] phase=bind sid=0x" << std::hex << rpcId
+                  << " pc=0x" << (ctx ? ctx->pc : 0u)
+                  << " ra=0x" << (ctx ? getRegU32(ctx, 31) : 0u)
+                  << " client=0x" << clientPtr << " mode=0x" << mode
+                  << " server=0x" << serverPtr << " reply_size=0x40"
+                  << " result=client-initialized provider=" << (serverPtr ? "registered-or-host" : "unresolved")
+                  << std::dec << std::endl;
         setReturnS32(ctx, 0);
     }
 
@@ -344,6 +357,8 @@ namespace ps2_syscalls
         std::lock_guard<std::recursive_mutex> rpcCallLock(g_sif_call_rpc_mutex);
 
         const uint32_t clientPtr = getRegU32(ctx, 4);
+        const uint32_t sourcePc = ctx ? ctx->pc : 0u;
+        const uint32_t sourceRa = ctx ? getRegU32(ctx, 31) : 0u;
         const uint32_t rpcNum = getRegU32(ctx, 5);
         const uint32_t mode = getRegU32(ctx, 6);
         const uint32_t sendBuf = getRegU32(ctx, 7);
@@ -474,6 +489,13 @@ namespace ps2_syscalls
             event.flags = kSifRpcDebugFlagMissingClient | ((mode & kSifRpcModeNowait) ? kSifRpcDebugFlagNowait : 0u);
             event.result = -1;
             pushSifRpcDebugEvent(event);
+            std::cout << "[RPC_SERVICE_EVENT] phase=request sid=0x" << std::hex << sidHint
+                      << " pc=0x" << sourcePc << " ra=0x" << sourceRa
+                      << " rpc=0x" << rpcNum << " client=0x" << clientPtr
+                      << " send=0x" << sendBuf << "/0x" << sendSize
+                      << " reply=0x" << receiveBuffer << "/0x" << receiveSize
+                      << " reply_size=0x" << receiveSize
+                      << " result=invalid-client provider=none" << std::dec << std::endl;
             setReturnS32(ctx, -1);
             return;
         }
@@ -573,6 +595,21 @@ namespace ps2_syscalls
         }
         const bool serverDispatched = guestFunction != 0u && runtime->hasFunction(guestFunction);
 
+        if (!iopResult.handled && !serverDispatched && server && server->func == 0u &&
+            PS2IopTransport::canBindRpc(runtime, sid))
+        {
+            std::cerr << "[RPC_SERVICE_EVENT] phase=request sid=0x" << std::hex << sid
+                      << " pc=0x" << sourcePc << " ra=0x" << sourceRa
+                      << " rpc=0x" << rpcNum << " send=0x" << sendBuf << "/0x" << sendSize
+                      << " reply=0x" << receiveBuffer << "/0x" << receiveSize
+                      << " reply_size=0x" << receiveSize
+                      << " result=unimplemented-provider=none action=fail-stop-no-synthetic-reply"
+                      << std::dec << std::endl;
+            runtime->requestStop();
+            setReturnS32(ctx, -1);
+            return;
+        }
+
         auto finishCall = [=](const R5900Context *guestResult, R5900Context &parent)
         {
             bool handled = iopResult.handled;
@@ -644,6 +681,17 @@ namespace ps2_syscalls
                     logUnhandledRpcTrace(event);
                 }
 #endif
+                std::cout << "[RPC_SERVICE_EVENT] phase=request sid=0x" << std::hex << sid
+                          << " pc=0x" << sourcePc << " ra=0x" << sourceRa
+                          << " rpc=0x" << rpcNum << " client=0x" << clientPtr
+                          << " send=0x" << sendBuf << "/0x" << sendSize
+                          << " reply=0x" << receiveBuffer << "/0x" << receiveSize
+                          << " reply_size=0x" << receiveSize
+                          << " result=" << (handled ? "handled" : "fallback")
+                          << " provider=" << (iopResult.handled ? "host-hle" : (serverDispatched ? "guest-server" : "fallback"))
+                          << " copied_fallback=" << (copiedFallback ? "true" : "false")
+                          << " zeroed_fallback=" << (zeroedFallback ? "true" : "false")
+                          << std::dec << std::endl;
                 pushSifRpcDebugEvent(event);
             };
 

@@ -1,8 +1,43 @@
 #include "Common.h"
 #include "System.h"
+#include <cstdlib>
+#include <array>
 
 namespace ps2_syscalls
 {
+    namespace
+    {
+        // EE syscall 0x0D installs one of the kernel's VTLB refill handlers.
+        // The native runner currently uses direct-mapped guest RAM, so no
+        // VTLB exception dispatch consumes this registry yet.
+        std::array<uint32_t, 16> g_vtlbRefillHandlers{};
+    }
+
+    void SetVTLBRefillHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        const uint32_t handlerIndex = getRegU32(ctx, 4);
+        const uint32_t handler = getRegU32(ctx, 5);
+        if (handlerIndex < g_vtlbRefillHandlers.size())
+        {
+            g_vtlbRefillHandlers[handlerIndex] = handler;
+        }
+    }
+
+    void GetGsDxDyOffset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        // Host-window presentation uses no board-specific display offset.
+        // This is an explicit HLE default for _GetGsDxDyOffset, not a claim
+        // that the EE hardware reports these values on every board.
+        for (uint32_t outputIndex = 0; outputIndex < 4; ++outputIndex)
+        {
+            const uint32_t outputAddress = getRegU32(ctx, 5 + outputIndex);
+            if (outputAddress == 0u)
+                continue;
+            if (uint32_t *output = getEeGuestStruct<uint32_t>(rdram, outputAddress))
+                *output = 0u;
+        }
+    }
+
     void GsSetCrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         int interlaced = getRegU32(ctx, 4); // $a0 - 0=non-interlaced, 1=interlaced
@@ -589,6 +624,16 @@ namespace ps2_syscalls
         (void)rdram;
 
         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
+
+        // Armageddon's HLE boot requests a root heap ending at 0x01FEC000.
+        // Keep this experiment opt-in; the generic runtime heap is still
+        // separate state and must not silently inherit this ceiling.
+        const char *hleTop = std::getenv("PS2X_ARMAGEDDON_HLE_HEAP_TOP");
+        if (hleTop && hleTop[0] == '1' && hleTop[1] == '\0')
+        {
+            setReturnU32(ctx, 0x01FF0000u);
+            return;
+        }
 
         const uint32_t ret = runtime
                                  ? runtime->guestHeapLimit()

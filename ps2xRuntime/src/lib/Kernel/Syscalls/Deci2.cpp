@@ -1,6 +1,7 @@
 #include "System.h"
 #include "Common.h"
 #include "ps2_runtime.h"
+#include <cstdlib>
 
 namespace
 {
@@ -125,6 +126,40 @@ namespace ps2_syscalls
 {
     void Deci2Call(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // Armageddon's startup logger waits on word 3 of the buffer supplied
+        // to Open (guest 0x10e064), not on Poll's return value. The normal
+        // release build compiles out the legacy Deci2 handler entirely.
+        if (std::getenv("PS2X_ARMAGEDDON_HLE_BOOT") != nullptr)
+        {
+            static uint32_t hleBufferAddr = 0u;
+            const int32_t code = static_cast<int32_t>(getRegU32(ctx, 4));
+            uint32_t args[4] = {};
+            readDeci2Args(rdram, getRegU32(ctx, 5), args);
+            if (code == 1) // Open: retain the guest-owned send descriptor.
+            {
+                hleBufferAddr = args[1];
+                setReturnS32(ctx, 1);
+                return;
+            }
+            if (code == 3) // ReqSend: complete this host-only debug send.
+            {
+                if (hleBufferAddr != 0u)
+                {
+                    if (uint8_t *pending = getMemPtr(rdram, hleBufferAddr + 12u))
+                    {
+                        const uint32_t complete = 0u;
+                        std::memcpy(pending, &complete, sizeof(complete));
+                    }
+                }
+                setReturnS32(ctx, 1);
+                return;
+            }
+            if (code == 4) // Poll: the guest checks the descriptor afterwards.
+            {
+                setReturnS32(ctx, 1);
+                return;
+            }
+        }
 #if defined(_DEBUG) || defined(RUNTIME_DECI2CALL)
         const int32_t code = static_cast<int32_t>(getRegU32(ctx, 4));
         const uint32_t argsAddr = getRegU32(ctx, 5);

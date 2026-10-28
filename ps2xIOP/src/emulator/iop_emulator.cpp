@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <iostream>
 #include <map>
 #include <optional>
 #include <span>
@@ -361,6 +362,16 @@ namespace ps2x::iop::detail
         {
             if (!cdvd.serviceDevice())
                 return;
+
+            if (std::getenv("PS2X_IOP_CDVD_TRACE") != nullptr)
+            {
+                std::cerr << "[IOP_CDVD_COMPLETION_QUEUED] cycle=" << totalCycles
+                          << " i_stat=0x" << std::hex << memory.interruptStatus()
+                          << " i_mask=0x" << memory.interruptMask()
+                          << " i_ctrl=0x" << memory.interruptControl()
+                          << " cdvd_i_stat=0x" << memory.read32(0x1F402008u)
+                          << std::dec << std::endl;
+            }
 
             // CDVD command completion is delivered through the guest's
             // registered IOP IRQ 2 handler. The one-cycle delay lets the
@@ -831,6 +842,17 @@ namespace ps2x::iop::detail
                     if (dma.irq < 0)
                         continue;
                     const bool dispatched = intrman.dispatchInterrupt(dma.irq, *this);
+                    if (dma.irq == kIopIrqCdvd && std::getenv("PS2X_IOP_CDVD_TRACE") != nullptr)
+                    {
+                        std::cerr << "[IOP_CDVD_COMPLETION_DISPATCHED] cycle=" << totalCycles
+                                  << " irq=0x" << std::hex << dma.irq
+                                  << " dispatched=" << (dispatched ? "true" : "false")
+                                  << " i_stat=0x" << memory.interruptStatus()
+                                  << " i_mask=0x" << memory.interruptMask()
+                                  << " i_ctrl=0x" << memory.interruptControl()
+                                  << " cdvd_i_stat=0x" << memory.read32(0x1F402008u)
+                                  << std::dec << std::endl;
+                    }
                     if (dma.irq == kIopIrqDmaSif1 && std::getenv("PS2X_SIF_TRACE_DATA") != nullptr)
                     {
                         std::ostringstream out;

@@ -16,6 +16,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace
 {
@@ -43,6 +44,32 @@ namespace
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
+
+    // Armageddon's no-input LGKBM HLE reply completes synchronously, unlike
+    // the asynchronous hardware service. Its idle worker (FUN_00523128) can
+    // therefore consume every timeslice at a higher priority than the main
+    // thread. In the explicitly opt-in HLE discovery profile, lend one
+    // scheduler selection to a lower-priority ready thread after that worker
+    // exhausts its slice. Normal scheduling remains unchanged.
+    int g_armageddonHleSkipPriorityOnce = -1;
+    uint32_t g_armageddonHleFairnessTraceCount = 0u;
+    std::unordered_map<uint64_t, uint64_t> g_irqHandlerFireCounts;
+    std::unordered_map<uint64_t, uint64_t> g_irqDispatchCounts;
+    uint64_t g_irqTraceRecords = 0u;
+
+    bool armageddonHleIdleKeyboardPoll(const R5900Context *context)
+    {
+        if (std::getenv("PS2X_ARMAGEDDON_HLE_BOOT") == nullptr ||
+            std::getenv("PS2X_ARMAGEDDON_HLE_FAIR_POLL") == nullptr || context == nullptr)
+            return false;
+        const uint32_t pc = context->pc;
+        const uint32_t ra = getRegU32(context, 31);
+        const auto inKeyboardWorker = [](uint32_t address)
+        {
+            return address >= 0x00523128u && address < 0x00523818u;
+        };
+        return inKeyboardWorker(pc) || inKeyboardWorker(ra);
+    }
 
     constexpr uint64_t microsecondsToEeCycles(uint64_t microseconds)
     {
@@ -201,6 +228,13 @@ void EeScheduler::run()
                                   << " status=" << static_cast<unsigned>(thread.status)
                                   << " wait_reason=" << static_cast<unsigned>(thread.wait.reason)
                                   << " pc=0x" << std::hex << thread.activeContext().pc << std::dec
+                                  << " ra=0x" << std::hex << getRegU32(&thread.activeContext(), 31)
+                                  << " sp=0x" << getRegU32(&thread.activeContext(), 29)
+                                  << " v0=0x" << getRegU32(&thread.activeContext(), 2)
+                                  << " a0=0x" << getRegU32(&thread.activeContext(), 4)
+                                  << " a1=0x" << getRegU32(&thread.activeContext(), 5)
+                                  << " a2=0x" << getRegU32(&thread.activeContext(), 6)
+                                  << " a3=0x" << getRegU32(&thread.activeContext(), 7) << std::dec
                                   << " invocation_depth=" << thread.invocations.size();
                         if (const auto *eventWait = std::get_if<EeEventFlagWait>(&thread.wait.payload))
                             std::cerr << " event_id=" << eventWait->id
@@ -465,7 +499,37 @@ void EeScheduler::run()
                           << " arg0=0x" << std::hex << getRegU32(&context, 4)
                           << " arg1=0x" << getRegU32(&context, 5) << std::dec << std::endl;
             }
+            static uint32_t armageddonDmacHandlerTraceCount = 0u;
+            const bool traceArmageddonDmacHandler =
+                context.pc == 0x001ACA60u && std::getenv("PS2X_ARMAGEDDON_DMA_HANDLER_TRACE") != nullptr &&
+                armageddonDmacHandlerTraceCount < 64u;
+            auto logArmageddonDmacHandler = [&](const char *phase)
+            {
+                if (!traceArmageddonDmacHandler)
+                    return;
+                uint32_t queueRead = 0u, queueWrite = 0u, status = 0u, secondaryStatus = 0u;
+                std::memcpy(&queueRead, m_rdram + 0x0064E544u, sizeof(queueRead));
+                std::memcpy(&queueWrite, m_rdram + 0x0064E540u, sizeof(queueWrite));
+                std::memcpy(&status, m_rdram + 0x0064E554u, sizeof(status));
+                std::memcpy(&secondaryStatus, m_rdram + 0x0064E550u, sizeof(secondaryStatus));
+                std::cerr << "[Armageddon guest DMAC handler] phase=" << phase
+                          << " count=" << armageddonDmacHandlerTraceCount + 1u
+                          << " thread=" << running->id
+                          << " invocation_depth=" << running->invocations.size()
+                          << " cause=0x" << std::hex << getRegU32(&context, 4)
+                          << " queue_read=0x" << queueRead << " queue_write=0x" << queueWrite
+                          << " status=0x" << status << " secondary_status=0x" << secondaryStatus
+                          << " d_stat=0x" << m_runtime.memory().readIORegister(0x1000E010u)
+                          << " pc=0x" << context.pc << " ra=0x" << getRegU32(&context, 31)
+                          << std::dec << std::endl;
+            };
+            if (traceArmageddonDmacHandler)
+            {
+                ++armageddonDmacHandlerTraceCount;
+                logArmageddonDmacHandler("entry");
+            }
             function(m_rdram, &context, &m_runtime);
+            logArmageddonDmacHandler("return");
             if (bindRpcFrameWatchActive && running->id == kMainThreadId)
             {
                 ++bindRpcFrameWatchDispatch;
@@ -584,13 +648,41 @@ void EeScheduler::postEvent(EeEvent event)
 
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
-    if (m_runtime.diagnosticCheckpoint(currentContext(), cycles))
+    R5900Context *const traceContext = currentContext();
+    const bool traceRenderWait =
+        std::getenv("PS2X_ARMAGEDDON_CHECKPOINT_TRACE") != nullptr && traceContext != nullptr &&
+        (traceContext->pc == 0x001AD5FCu || traceContext->pc == 0x001AD630u);
+    static uint32_t renderWaitCheckpointTraceCount = 0u;
+    const uint64_t cycleBefore = m_eeCycle;
+    const auto traceRenderCheckpoint = [&](const char *reason)
+    {
+        if (!traceRenderWait || renderWaitCheckpointTraceCount >= 128u)
+            return;
+        ++renderWaitCheckpointTraceCount;
+        const GuestThread *const thread = currentThread();
+        std::cerr << "[Armageddon HLE render-wait checkpoint] n=" << renderWaitCheckpointTraceCount
+                  << " pc=0x" << std::hex << traceContext->pc
+                  << " thread=" << std::dec << (thread ? thread->id : 0u)
+                  << " cycles=" << cycles
+                  << " cycle_before=" << cycleBefore
+                  << " cycle_after=" << m_eeCycle
+                  << " slice_end=" << m_sliceEndCycle
+                  << " pending=" << (m_checkpointPending.load(std::memory_order_acquire) ? "true" : "false")
+                  << " stop=" << (m_stopRequested.load(std::memory_order_acquire) ? "true" : "false")
+                  << " reason=" << reason << std::endl;
+    };
+
+    if (m_runtime.diagnosticCheckpoint(traceContext, cycles))
+    {
+        traceRenderCheckpoint("diagnostic");
         return true;
+    }
     accountCycles(cycles);
 
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))
     {
+        traceRenderCheckpoint("pending-or-stop");
         return true;
     }
 
@@ -598,23 +690,53 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
     {
         m_checkpointPending.store(true, std::memory_order_release);
+        traceRenderCheckpoint("event-deadline");
         return true;
     }
 
     if (m_eeCycle < m_sliceEndCycle)
     {
+        traceRenderCheckpoint("within-slice");
         return false;
     }
 
     const GuestThread *running = currentThread();
+    if (running != nullptr && armageddonHleIdleKeyboardPoll(traceContext))
+    {
+        for (int priority = running->currentPriority + 1; priority < kPriorityCount; ++priority)
+        {
+            if (!m_readyQueues[static_cast<size_t>(priority)].empty())
+            {
+                m_rescheduleRequested = true;
+                m_timeSliceExpired = true;
+                g_armageddonHleSkipPriorityOnce = running->currentPriority;
+                if (g_armageddonHleFairnessTraceCount < 32u)
+                {
+                    ++g_armageddonHleFairnessTraceCount;
+                    std::cerr << "[Armageddon HLE fairness handoff] count="
+                              << g_armageddonHleFairnessTraceCount
+                              << " reason=synchronous-no-input-LGKBM-poll"
+                              << " thread=" << running->id
+                              << " pc=0x" << std::hex << (traceContext ? traceContext->pc : 0u)
+                              << " priority=" << std::dec << running->currentPriority
+                              << " next_lower_priority=" << priority << std::endl;
+                }
+                traceRenderCheckpoint("Armageddon-HLE-keyboard-poll-fairness");
+                return true;
+            }
+        }
+    }
+
     if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
     {
         m_rescheduleRequested = true;
         m_timeSliceExpired = true;
+        traceRenderCheckpoint("timeslice-ready-thread");
         return true;
     }
 
     renewTimeSlice();
+    traceRenderCheckpoint("renewed-slice-no-ready-thread");
     return false;
 }
 
@@ -1487,10 +1609,53 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
 void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
 {
     assertExecutor();
+    // Hardware status latches on the event even when no guest callback is
+    // installed or the interrupt source is masked. Armageddon polls
+    // INTC_STAT directly during startup (0x0010CCB0), so publishing only
+    // enabled callbacks leaves its wait loop stuck forever.
+    if (!dmac && cause < 15u)
+        m_runtime.memory().writeIORegister(0xFFFFFFFCu, 1u << cause);
     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
     const bool traceSif0 = dmac && cause == 5u && std::getenv("PS2X_SIF_TRACE_DATA") != nullptr;
+    const bool traceArmageddonDma = dmac && cause <= 2u &&
+                                    std::getenv("PS2X_ARMAGEDDON_DMA_IRQ_TRACE") != nullptr;
+    const uint64_t dispatchKey = (static_cast<uint64_t>(dmac ? 1u : 0u) << 63u) |
+                                 (static_cast<uint64_t>(cause & 0x7FFFFFFFu) << 32u);
+    const uint64_t dispatchCount = ++g_irqDispatchCounts[dispatchKey];
+    const char *irqTrace = std::getenv("PS2X_EE_IRQ_TRACE");
+    if (irqTrace && irqTrace[0] != '\0' && irqTrace[0] != '0' && g_irqTraceRecords < 8192u)
+    {
+        ++g_irqTraceRecords;
+        std::cerr << "[EE_IRQ_EVENT] type=" << (dmac ? "DMAC" : "INTC")
+                  << " cause=" << cause
+                  << " dispatch_count=" << dispatchCount
+                  << " cause_enabled=" << ((cause >= 32u || (mask & (1u << cause)) != 0u) ? "true" : "false")
+                  << " tick=" << m_vsyncTick
+                  << " intc_stat=0x" << std::hex << m_runtime.memory().readIORegister(0x1000F000u)
+                  << " intc_mask=0x" << m_runtime.memory().readIORegister(0x1000F010u)
+                  << " d_stat=0x" << m_runtime.memory().readIORegister(0x1000E010u)
+                  << std::dec << '\n';
+    }
     if (cause < 32u && (mask & (1u << cause)) == 0u)
     {
+        if (traceArmageddonDma)
+        {
+            size_t registered = 0u;
+            size_t enabled = 0u;
+            for (const auto &[id, handler] : m_dmacHandlers)
+            {
+                (void)id;
+                if (handler.cause == cause)
+                {
+                    ++registered;
+                    enabled += handler.enabled ? 1u : 0u;
+                }
+            }
+            std::cerr << "[Armageddon DMAC IRQ] cause=" << cause
+                      << " enabled_mask=0x" << std::hex << mask << std::dec
+                      << " cause_enabled=false registered_handlers=" << registered
+                      << " enabled_handlers=" << enabled << std::endl;
+        }
         if (traceSif0)
             std::cerr << "[EE_SIF0_IRQ] cause=5 enabled=false handlers=0" << std::endl;
         return;
@@ -1508,6 +1673,15 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     }
     std::sort(matching.begin(), matching.end(), [](const EeIrqHandler &left, const EeIrqHandler &right)
               { return left.order < right.order; });
+    if (traceArmageddonDma)
+    {
+        std::cerr << "[Armageddon DMAC IRQ] cause=" << cause
+                  << " enabled_mask=0x" << std::hex << mask << std::dec
+                  << " cause_enabled=true registered_handlers=" << matching.size();
+        for (const EeIrqHandler &handler : matching)
+            std::cerr << " handler=0x" << std::hex << handler.handler << std::dec;
+        std::cerr << std::endl;
+    }
     if (traceSif0)
     {
         std::cerr << "[EE_SIF0_IRQ] cause=5 enabled=true handlers=" << matching.size();
@@ -1596,6 +1770,32 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     }
     for (const EeIrqHandler &handler : matching)
     {
+        const uint64_t key = (static_cast<uint64_t>(dmac ? 1u : 0u) << 63u) |
+                             (static_cast<uint64_t>(cause & 0x7FFFFFFFu) << 32u) |
+                             static_cast<uint32_t>(handler.id);
+        const uint64_t fireCount = ++g_irqHandlerFireCounts[key];
+        const char *irqTrace = std::getenv("PS2X_EE_IRQ_TRACE");
+        if (irqTrace && irqTrace[0] != '\0' && irqTrace[0] != '0' && g_irqTraceRecords < 8192u)
+        {
+            ++g_irqTraceRecords;
+            uint32_t interruptedPc = 0u;
+            uint32_t interruptedRa = 0u;
+            if (const GuestThread *owner = currentThread())
+            {
+                interruptedPc = owner->activeContext().pc;
+                interruptedRa = getRegU32(&owner->activeContext(), 31);
+            }
+            std::cerr << "[EE_IRQ_FIRE] type=" << (dmac ? "DMAC" : "INTC")
+                      << " cause=" << cause
+                      << " handler_id=" << handler.id
+                      << " handler=0x" << std::hex << handler.handler
+                      << " arg=0x" << handler.argument
+                      << " source_pc=0x" << interruptedPc
+                      << " source_ra=0x" << interruptedRa
+                      << " d_stat=0x" << m_runtime.memory().readIORegister(0x1000E010u)
+                      << " intc_stat=0x" << m_runtime.memory().readIORegister(0x1000F000u)
+                      << std::dec << " fire_count=" << fireCount << '\n';
+        }
         GuestInvocation invocation{};
         invocation.kind = GuestInvocationKind::Interrupt;
         invocation.context.pc = handler.handler;
@@ -1944,6 +2144,26 @@ void EeScheduler::removeReady(GuestThread &item)
 
 GuestThread *EeScheduler::selectReady()
 {
+    if (g_armageddonHleSkipPriorityOnce >= 0)
+    {
+        const int firstLowerPriority = std::clamp(g_armageddonHleSkipPriorityOnce + 1,
+                                                  0,
+                                                  kPriorityCount - 1);
+        g_armageddonHleSkipPriorityOnce = -1;
+        for (int priority = firstLowerPriority; priority < kPriorityCount; ++priority)
+        {
+            auto &queue = m_readyQueues[static_cast<size_t>(priority)];
+            if (queue.empty())
+                continue;
+            const int id = queue.front();
+            queue.pop_front();
+            GuestThread *selected = thread(id);
+            assert(selected != nullptr);
+            assert(selected->status == EeThreadStatus::Ready);
+            return selected;
+        }
+    }
+
     for (auto &queue : m_readyQueues)
     {
         if (queue.empty())

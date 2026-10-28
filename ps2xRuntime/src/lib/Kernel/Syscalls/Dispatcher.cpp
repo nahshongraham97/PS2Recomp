@@ -1,6 +1,8 @@
 #include "Common.h"
 #include "Dispatcher.h"
 #include "System.h"
+#include <iostream>
+#include <cstdlib>
 
 namespace ps2_syscalls
 {
@@ -21,6 +23,9 @@ namespace ps2_syscalls
             return true;
         case 0x04:
             ExitThread(rdram, ctx, runtime);
+            return true;
+        case 0x0D:
+            SetVTLBRefillHandler(rdram, ctx, runtime);
             return true;
         case 0x10:
             AddIntcHandler(rdram, ctx, runtime);
@@ -311,6 +316,12 @@ namespace ps2_syscalls
         case static_cast<uint32_t>(-0x7A):
             ps2_stubs::sceSifGetReg(rdram, ctx, runtime);
             return true;
+        case 0x6B:
+            ps2_stubs::sceSifStopDma(rdram, ctx, runtime);
+            return true;
+        case 0x80:
+            GetGsDxDyOffset(rdram, ctx, runtime);
+            return true;
         case 0x7F:
             GetMemorySize(rdram, ctx, runtime);
             return true;
@@ -319,8 +330,23 @@ namespace ps2_syscalls
             return true;
         case 0x7C:
         case static_cast<uint32_t>(-0x7C):
+        {
+            static uint32_t armageddonDeci2TraceCount = 0u;
+            const bool traceArmageddonDeci2 =
+                std::getenv("PS2X_ARMAGEDDON_HLE_BOOT") != nullptr &&
+                armageddonDeci2TraceCount++ < 8u;
+            if (traceArmageddonDeci2)
+                std::cerr << "[Armageddon HLE Deci2 boundary] phase=before pc=0x"
+                          << std::hex << ctx->pc << " ra=0x" << getRegU32(ctx, 31)
+                          << " code=0x" << getRegU32(ctx, 4)
+                          << " args=0x" << getRegU32(ctx, 5) << std::dec << '\n';
             Deci2Call(rdram, ctx, runtime);
+            if (traceArmageddonDeci2)
+                std::cerr << "[Armageddon HLE Deci2 boundary] phase=after pc=0x"
+                          << std::hex << ctx->pc << " v0=0x" << getRegU32(ctx, 2)
+                          << std::dec << '\n';
             return true;
+        }
         case 0x83:
             FindAddress(rdram, ctx, runtime);
             return true;
