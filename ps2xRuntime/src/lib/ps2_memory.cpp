@@ -1635,14 +1635,32 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             m_pendingVif0Transfers.push_back(std::move(pt));
                         }
                     }
-                    // else if (channelBase == 0x10009000u)
-                    // {
-
-                    // }
+                    else
+                    {
+                        const uint32_t cause = (channelBase == 0x1000A000u) ? 2u :
+                                               (channelBase == 0x10009000u) ? 1u :
+                                               (channelBase == 0x10008000u) ? 0u : 0xFFFFFFFFu;
+                        if (cause != 0xFFFFFFFFu)
+                        {
+                            m_ioRegisters[channelBase + 0x20u] = 0u;
+                            completeDmacChannel(channelBase, cause);
+                        }
+                    }
                 }
                 else if (qwc > 0)
                 {
                     enqueueTransfer(madr, qwc);
+                }
+                else
+                {
+                    const uint32_t cause = (channelBase == 0x1000A000u) ? 2u :
+                                           (channelBase == 0x10009000u) ? 1u :
+                                           (channelBase == 0x10008000u) ? 0u : 0xFFFFFFFFu;
+                    if (cause != 0xFFFFFFFFu)
+                    {
+                        m_ioRegisters[channelBase + 0x20u] = 0u;
+                        completeDmacChannel(channelBase, cause);
+                    }
                 }
 
                 const bool autoProcessTransfers =
