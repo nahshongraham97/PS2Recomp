@@ -99,6 +99,10 @@ namespace
     PS2Runtime::RecompiledFunction gOriginalSifDmaInitializer = nullptr;
     PS2Runtime::RecompiledFunction gOriginalStartupCoordinator = nullptr;
     PS2Runtime::RecompiledFunction gOriginalStartupSubsystem = nullptr;
+    PS2Runtime::RecompiledFunction gOriginalPadPoll = nullptr;
+    PS2Runtime::RecompiledFunction gOriginalTitleScreenUpdate = nullptr;
+    PS2Runtime::RecompiledFunction gOriginalMainMenuInit = nullptr;
+    PS2Runtime::RecompiledFunction gOriginalPressStartPoll = nullptr;
     struct NestedFunctionProbe
     {
         const char *name;
@@ -590,6 +594,125 @@ namespace
                   << std::dec << std::endl;
     }
 
+    static uint64_t gPadPollFrames = 0;
+    static uint64_t gPressStartPollCount = 0;
+    static bool gSimulateStartInput = false;
+
+    void probePressStartPoll(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ++gPressStartPollCount;
+        if (gOriginalPressStartPoll)
+        {
+            gOriginalPressStartPoll(rdram, ctx, runtime);
+        }
+        if (gSimulateStartInput && ctx)
+        {
+            SET_GPR_S32(ctx, 2, 1);
+        }
+        if (gPressStartPollCount <= 10 || (gPressStartPollCount % 60 == 0))
+        {
+            std::cout << "[Armageddon Press Start Poll] call=" << gPressStartPollCount
+                      << " v0=0x" << std::hex << (ctx ? getRegU32(ctx, 2) : 0u)
+                      << " sim=" << gSimulateStartInput << std::dec << std::endl;
+        }
+    }
+
+    static uint64_t gTitleUpdateFrames = 0;
+
+    void probeTitleScreenUpdate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ++gTitleUpdateFrames;
+        const uint32_t gp = ctx ? getRegU32(ctx, 28) : 0x006540f0u;
+        const uint32_t currentFlag = READ32(gp - 0x5DBC);
+
+        if (gTitleUpdateFrames <= 10 || (gTitleUpdateFrames % 60 == 0))
+        {
+            std::cout << "[Armageddon Title Update] frame=" << gTitleUpdateFrames
+                      << " gp=0x" << std::hex << gp
+                      << " start_flag=0x" << currentFlag
+                      << std::dec << std::endl;
+        }
+
+        // Hold title screen stably for 60 update frames (1+ second of active title loop)
+        // Then inject simulated START button press by setting gp-0x5DBC = 1 and padArea active-low bits!
+        if (gTitleUpdateFrames >= 60)
+        {
+            gSimulateStartInput = true;
+            WRITE32(gp - 0x5DBC, 1u);
+            const uint32_t padArea = READ32(0x00657410u);
+            if (padArea != 0 && padArea < 32u * 1024u * 1024u)
+            {
+                rdram[padArea + 0x5Eu] &= ~0x08u;
+                rdram[padArea + 0xDEu] &= ~0x08u;
+            }
+            if (gTitleUpdateFrames == 60)
+            {
+                std::cout << "[Armageddon Input Injection] START BUTTON PRESSED at title frame 60 -> gp-0x5DBC = 1"
+                          << " (transitioning to Main Menu 0x155250)" << std::endl;
+            }
+        }
+
+        if (gOriginalTitleScreenUpdate)
+        {
+            gOriginalTitleScreenUpdate(rdram, ctx, runtime);
+        }
+    }
+
+    void probeMainMenuInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        std::cout << "[Armageddon Main Menu Enter] entry_pc=0x155250"
+                  << " ra=0x" << std::hex << (ctx ? getRegU32(ctx, 31) : 0u)
+                  << " sp=0x" << (ctx ? getRegU32(ctx, 29) : 0u)
+                  << std::dec << std::endl;
+        if (gOriginalMainMenuInit)
+        {
+            gOriginalMainMenuInit(rdram, ctx, runtime);
+        }
+    }
+
+    void probePadPoll(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ++gPadPollFrames;
+        const uint32_t padArea = READ32(0x00657410u);
+        if (padArea != 0 && padArea < 32u * 1024u * 1024u)
+        {
+            if (gPadPollFrames <= 10 || (gPadPollFrames % 60 == 0))
+            {
+                std::cout << "[Armageddon Pad Poll] frame=" << gPadPollFrames
+                          << " padArea=0x" << std::hex << padArea
+                          << " state=0x" << (uint32_t)rdram[padArea + 0x70u]
+                          << " btn0=0x" << (uint32_t)rdram[padArea + 0x5Eu]
+                          << " btn1=0x" << (uint32_t)rdram[padArea + 0x5Fu]
+                          << std::dec << std::endl;
+            }
+            if ((gPadPollFrames >= 180 && gPadPollFrames <= 240) ||
+                (gPadPollFrames >= 300 && gPadPollFrames <= 360))
+            {
+                rdram[padArea + 0x5Eu] &= ~0x08u;
+                rdram[padArea + 0xDEu] &= ~0x08u;
+                if (gPadPollFrames == 180 || gPadPollFrames == 300)
+                {
+                    std::cout << "[Armageddon Input Injection] START PRESSED at pad frame "
+                              << gPadPollFrames << " padArea=0x" << std::hex << padArea << std::dec << std::endl;
+                }
+            }
+            else
+            {
+                rdram[padArea + 0x5Eu] |= 0x08u;
+                rdram[padArea + 0xDEu] |= 0x08u;
+                if (gPadPollFrames == 241 || gPadPollFrames == 361)
+                {
+                    std::cout << "[Armageddon Input Injection] START RELEASED at pad frame "
+                              << gPadPollFrames << std::endl;
+                }
+            }
+        }
+        if (gOriginalPadPoll)
+        {
+            gOriginalPadPoll(rdram, ctx, runtime);
+        }
+    }
+
     void probeStartupCoordinator(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t entryPc = ctx ? ctx->pc : 0u;
@@ -946,6 +1069,13 @@ static void FUN_0012e670_hle_full(uint8_t *rdram, R5900Context *ctx, PS2Runtime 
 
     const uint32_t gp = GPR_U32(ctx, 28);
     uint32_t node = READ32(listPtr);
+    static uint64_t gSchedCount = 0;
+    ++gSchedCount;
+    if (gSchedCount <= 5 || (gSchedCount % 600 == 0))
+    {
+        std::cout << "[HLE Scheduler] call=" << gSchedCount << " listPtr=0x" << std::hex << listPtr
+                  << " head_node=0x" << node << std::dec << std::endl;
+    }
 
     while (node != 0)
     {
@@ -1002,10 +1132,28 @@ static void FUN_0012e670_hle_full(uint8_t *rdram, R5900Context *ctx, PS2Runtime 
 
                 if (targetPc != 0)
                 {
+                    static uint64_t gProcExecCount = 0;
+                    ++gProcExecCount;
+                    if (gProcExecCount <= 30 || (gProcExecCount % 300 == 0))
+                    {
+                        std::cout << "[HLE Proc Exec] count=" << gProcExecCount
+                                  << " proc=0x" << std::hex << proc
+                                  << " target=0x" << targetPc << std::dec << std::endl;
+                    }
                     WRITE32(gp - 0x61b4, 0x0012E8E4u); // return RA
                     WRITE32(gp - 0x61b8, GPR_U32(ctx, 29)); // return SP
+                    const uint32_t procSp = READ32(proc + 0xf4);
+                    if (procSp != 0)
+                    {
+                        SET_GPR_U32(ctx, 29, procSp);
+                    }
                     ctx->pc = targetPc;
                     runtime->dispatchGuestBranch(rdram, ctx, targetPc, 0x0012E8DCu, 0x0012E8E4u, PS2Runtime::GuestBranchKind::DirectCall, "JALR");
+                    const uint32_t schedSp = READ32(gp - 0x61b8);
+                    if (schedSp != 0)
+                    {
+                        SET_GPR_U32(ctx, 29, schedSp);
+                    }
                 }
             }
             node = READ32(node + 4);
@@ -1024,6 +1172,7 @@ static void FUN_0012e670_hle_full(uint8_t *rdram, R5900Context *ctx, PS2Runtime 
     WRITE32(gp - 0x61a4, 0); // 0x64df4c = 0
     ctx->pc = GPR_U32(ctx, 31);
 }
+
 
 int main(int argc, char **argv)
 {
@@ -1606,7 +1755,11 @@ int main(int argc, char **argv)
       installProbe(runtime, 0x00225D50u, probeAllocatorPoll, gOriginalAllocatorPoll) &&
         installProbe(runtime, 0x001ACA60u, probeQueueService, gOriginalQueueService) &&
         installProbeRange(runtime, 0x00122740u, 0x00122AC8u, probeStartupCoordinator, gOriginalStartupCoordinator) &&
-        installProbeRange(runtime, 0x00127260u, 0x00127364u, probeStartupSubsystem, gOriginalStartupSubsystem);
+        installProbeRange(runtime, 0x00127260u, 0x00127364u, probeStartupSubsystem, gOriginalStartupSubsystem) &&
+        installProbe(runtime, 0x002214D0u, probePadPoll, gOriginalPadPoll) &&
+        installProbe(runtime, 0x00185CD0u, probePressStartPoll, gOriginalPressStartPoll) &&
+        installProbe(runtime, 0x0018D8E0u, probeTitleScreenUpdate, gOriginalTitleScreenUpdate) &&
+        installProbe(runtime, 0x00155250u, probeMainMenuInit, gOriginalMainMenuInit);
     const bool initializerProbesInstalled =
         installNestedFunctionProbe(runtime, 0x001A6DD0u, "FUN_001A6DD0") &&
         installNestedFunctionProbe(runtime, 0x0019F5B0u, "FUN_0019F5B0") &&
