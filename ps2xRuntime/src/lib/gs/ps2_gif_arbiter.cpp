@@ -7,6 +7,11 @@ GifArbiter::GifArbiter(ProcessPacketFn processFn)
 {
 }
 
+GifArbiter::GifArbiter(ProcessPacketLegacyFn processLegacyFn)
+{
+    setProcessPacketFn(std::move(processLegacyFn));
+}
+
 bool GifArbiter::isImagePacket(const uint8_t *data, uint32_t sizeBytes)
 {
     if (!data || sizeBytes < 16u)
@@ -56,7 +61,7 @@ void GifArbiter::drain()
         auto &pkt = m_queue[i];
         if (!pkt.data.empty())
         {
-            m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+            m_processFn(pkt.pathId, pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
         }
     }
     m_queue.clear();

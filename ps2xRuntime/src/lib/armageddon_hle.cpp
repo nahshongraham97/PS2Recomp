@@ -25,6 +25,30 @@
 
 namespace armageddon_hle
 {
+void populatePadBuffer(PadDataNew &buf, uint32_t frameVal, uint32_t counterVal, uint8_t state, uint8_t reqState)
+{
+    std::memset(&buf, 0, sizeof(PadDataNew));
+    buf.frame = frameVal;
+    buf.modeTable[0] = 7u; // DualShock mode ID
+    buf.modeTable[1] = 4u; // Digital mode ID
+    buf.frameCounter = counterVal;
+    buf.data[0] = 0x00u;
+    buf.data[1] = 0x79u; // DualShock 2 ID
+    buf.data[2] = 0xFFu; // Buttons unpressed
+    buf.data[3] = 0xFFu;
+    buf.data[4] = 0x7Fu; // Analogs centered
+    buf.data[5] = 0x7Fu;
+    buf.data[6] = 0x7Fu;
+    buf.data[7] = 0x7Fu;
+    buf.modeConfig = 2u;   // 2 supported modes
+    buf.modeCurId = 0x79u; // DualShock 2 type
+    buf.mode = 7u;         // DualShock mode
+    buf.lock = 3u;         // Locked in analog mode
+    buf.state = state;
+    buf.reqState = reqState;
+    buf.currentTask = 1u;
+    buf.length = 32u;
+}
     namespace
     {
         std::mutex gStdioHandleMutex;
@@ -991,44 +1015,9 @@ namespace armageddon_hle
                                   << " bytes=0x100" << std::dec << std::endl;
                         return {};
                     }
-                    std::memset(padData, 0, 0x100u);
-                    // Buffer 0 (offset 0x00)
-                    *reinterpret_cast<uint16_t *>(padData + 0x50u) = 7u; // DualShock mode ID
-                    *reinterpret_cast<uint16_t *>(padData + 0x52u) = 4u; // Digital mode ID
-                    *reinterpret_cast<uint32_t *>(padData + 0x58u) = 1u;
-                    padData[0x5Cu + 0] = 0x00u;
-                    padData[0x5Cu + 1] = 0x79u; // DualShock 2 ID
-                    padData[0x5Cu + 2] = 0xFFu; // Buttons unpressed
-                    padData[0x5Cu + 3] = 0xFFu;
-                    padData[0x5Cu + 4] = 0x7Fu; // Analogs centered
-                    padData[0x5Cu + 5] = 0x7Fu;
-                    padData[0x5Cu + 6] = 0x7Fu;
-                    padData[0x5Cu + 7] = 0x7Fu;
-                    padData[0x64u] = 2u; // 2 supported modes
-                    padData[0x65u] = 0x79u; // DualShock 2 type
-                    padData[0x70u] = 0x06u; // PAD_STATE_STABLE
-                    padData[0x71u] = 0x00u; // PAD_RSTAT_COMPLETE
-                    padData[0x72u] = 0x01u; // ok
-                    padData[0x73u] = 0x20u; // len = 32
-
-                    // Buffer 1 (offset 0x80)
-                    *reinterpret_cast<uint16_t *>(padData + 0xD0u) = 7u;
-                    *reinterpret_cast<uint16_t *>(padData + 0xD2u) = 4u;
-                    *reinterpret_cast<uint32_t *>(padData + 0xD8u) = 0u;
-                    padData[0xDCu + 0] = 0x00u;
-                    padData[0xDCu + 1] = 0x79u;
-                    padData[0xDCu + 2] = 0xFFu;
-                    padData[0xDCu + 3] = 0xFFu;
-                    padData[0xDCu + 4] = 0x7Fu;
-                    padData[0xDCu + 5] = 0x7Fu;
-                    padData[0xDCu + 6] = 0x7Fu;
-                    padData[0xDCu + 7] = 0x7Fu;
-                    padData[0xE4u] = 2u;
-                    padData[0xE5u] = 0x79u;
-                    padData[0xF0u] = 0x06u; // PAD_STATE_STABLE
-                    padData[0xF1u] = 0x00u; // PAD_RSTAT_COMPLETE
-                    padData[0xF2u] = 0x01u; // ok
-                    padData[0xF3u] = 0x20u; // len = 32
+                    PadAreaNew &area = *reinterpret_cast<PadAreaNew *>(padData);
+                    populatePadBuffer(area.buffers[0], 1u, 1u, PAD_STATE_STABLE, PAD_RSTAT_COMPLETE);
+                    populatePadBuffer(area.buffers[1], 0u, 0u, PAD_STATE_STABLE, PAD_RSTAT_COMPLETE);
 
                     std::cout << "[Armageddon HLE PAD state] open_area=0x" << std::hex << padArea
                               << " buffer0_state=STABLE buffer1_state=STABLE"

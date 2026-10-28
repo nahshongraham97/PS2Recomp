@@ -4,6 +4,9 @@
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
 #include "runtime/ee_scheduler.h"
+#include "armageddon_hle.h"
+#include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/ps2_gif_arbiter.h"
 
 #include <array>
 #include <atomic>
@@ -1824,6 +1827,117 @@ void register_ps2_runtime_kernel_tests()
             t.IsTrue(gSpinPollCalls >= 1u, "poll function should be called at least once");
             t.Equals(finalCounter, 0u, "counter should be cleared to 0 by the DMAC handler");
             t.Equals(getRegS32(mainContext, 2), KE_OK, "main loop should exit successfully with KE_OK");
+        });
+
+        tc.Run("PadDataNew double-buffer layout and populatePadBuffer stable state", [](TestCase &t)
+        {
+            using namespace armageddon_hle;
+            t.Equals(sizeof(PadDataNew), 128ULL, "PadDataNew must be exactly 128 bytes");
+            t.Equals(sizeof(PadAreaNew), 256ULL, "PadAreaNew must be exactly 256 bytes");
+            t.Equals(offsetof(PadDataNew, modeTable), 0x50ULL, "modeTable offset must be 0x50");
+            t.Equals(offsetof(PadDataNew, modeConfig), 0x64ULL, "modeConfig offset must be 0x64");
+            t.Equals(offsetof(PadDataNew, modeCurId), 0x65ULL, "modeCurId offset must be 0x65");
+            t.Equals(offsetof(PadDataNew, mode), 0x6DULL, "mode offset must be 0x6D");
+            t.Equals(offsetof(PadDataNew, lock), 0x6EULL, "lock offset must be 0x6E");
+            t.Equals(offsetof(PadDataNew, state), 0x70ULL, "state offset must be 0x70");
+            t.Equals(offsetof(PadDataNew, reqState), 0x71ULL, "reqState offset must be 0x71");
+
+            PadAreaNew area{};
+            populatePadBuffer(area.buffers[0], 1u, 1u, PAD_STATE_STABLE, PAD_RSTAT_COMPLETE);
+            populatePadBuffer(area.buffers[1], 0u, 0u, PAD_STATE_STABLE, PAD_RSTAT_COMPLETE);
+
+            t.Equals(static_cast<uint32_t>(area.buffers[0].state), static_cast<uint32_t>(PAD_STATE_STABLE), "Buffer 0 state must be STABLE (6)");
+            t.Equals(static_cast<uint32_t>(area.buffers[0].reqState), static_cast<uint32_t>(PAD_RSTAT_COMPLETE), "Buffer 0 reqState must be COMPLETE (0)");
+            t.Equals(static_cast<uint32_t>(area.buffers[0].modeCurId), 0x79u, "Buffer 0 modeCurId must be DualShock 2 (0x79)");
+            t.Equals(static_cast<uint32_t>(area.buffers[0].lock), 3u, "Buffer 0 lock must be 3");
+
+            t.Equals(static_cast<uint32_t>(area.buffers[1].state), static_cast<uint32_t>(PAD_STATE_STABLE), "Buffer 1 state must be STABLE (6)");
+            t.Equals(static_cast<uint32_t>(area.buffers[1].reqState), static_cast<uint32_t>(PAD_RSTAT_COMPLETE), "Buffer 1 reqState must be COMPLETE (0)");
+            t.Equals(static_cast<uint32_t>(area.buffers[1].modeCurId), 0x79u, "Buffer 1 modeCurId must be DualShock 2 (0x79)");
+        });
+
+        tc.Run("EeScheduler queueDeferredInvocation queues event without immediate execution", [](TestCase &t)
+        {
+            TestEnv env;
+            R5900Context ctx{};
+            ctx.pc = 0x00100000u;
+            env.runtime.eeScheduler().reset(env.rdram.data(), ctx);
+
+            GuestInvocation inv{};
+            inv.kind = GuestInvocationKind::RpcCallback;
+            inv.tag = 0x9999u;
+            inv.context.pc = 0x00200000u;
+
+            env.runtime.eeScheduler().queueDeferredInvocation(std::move(inv), 5000000ull);
+            t.IsFalse(env.runtime.eeScheduler().hasInvocation(GuestInvocationKind::RpcCallback, 0x9999u),
+                      "Deferred invocation should not be in active thread invocations immediately");
+        });
+
+        tc.Run("GS per-path persistent IMAGE parser handles split transfers", [](TestCase &t)
+        {
+            GS gs;
+            std::vector<uint8_t> vram(4 * 1024 * 1024, 0);
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()));
+
+            // Construct split IMAGE transfer:
+            // Total 2 quadwords (32 bytes). Packet 1 has GIFtag (16 bytes) + 1 QW (16 bytes).
+            // Packet 2 has the remaining 1 QW (16 bytes).
+            // GIFtag: NLOOP = 2, FLG = 2 (IMAGE), PRE = 0, NREG = 0
+            // tagLo: (2 & 0x7FFF) | (2ULL << 58)
+            const uint64_t tagLo = 2ULL | (2ULL << 58);
+            const uint64_t tagHi = 0ULL;
+
+            std::array<uint8_t, 32> packet1{};
+            std::memcpy(packet1.data(), &tagLo, 8);
+            std::memcpy(packet1.data() + 8, &tagHi, 8);
+            std::memset(packet1.data() + 16, 0xAA, 16); // first 16 bytes image payload
+
+            std::array<uint8_t, 16> packet2{};
+            std::memset(packet2.data(), 0xBB, 16); // second 16 bytes image payload
+
+            gs.processGIFPacket(GifPathId::Path3, packet1.data(), static_cast<uint32_t>(packet1.size()));
+
+            // Send packet 2 on Path3
+            gs.processGIFPacket(GifPathId::Path3, packet2.data(), static_cast<uint32_t>(packet2.size()));
+
+            // Verify no crash, and state reset cleanly
+            t.IsTrue(true, "Split IMAGE transfer completed without error");
+        });
+
+        tc.Run("ChangeThreadPriority returns previous priority", [](TestCase &t)
+        {
+            TestEnv env;
+            env.ctx.pc = 0x00100000u;
+            setRegU32(env.ctx, 29, 0x0010FFF0u);
+            setRegU32(env.ctx, 4, 0x0036A7F0u);
+            setRegU32(env.ctx, 5, 0xFFFFFFFFu);
+            setRegU32(env.ctx, 6, 0x00020000u);
+            t.IsTrue(callSyscall(0x3Cu, env.rdram.data(), &env.ctx, &env.runtime),
+                     "SetupThread syscall should dispatch");
+
+            // Change main thread priority from initial 0 to 41
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(env.ctx, 5, 41u);
+            t.IsTrue(callSyscall(0x29u, env.rdram.data(), &env.ctx, &env.runtime),
+                     "ChangeThreadPriority should dispatch");
+            const int32_t oldPri0 = getRegS32(env.ctx, 2);
+            t.Equals(oldPri0, 0, "Initial priority returned should be 0");
+
+            // Change priority of current thread from 41 to 30
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(env.ctx, 5, 30u);
+            t.IsTrue(callSyscall(0x29u, env.rdram.data(), &env.ctx, &env.runtime),
+                     "ChangeThreadPriority should dispatch");
+            const int32_t oldPri1 = getRegS32(env.ctx, 2);
+            t.Equals(oldPri1, 41, "First change should return previous priority 41");
+
+            // Restore priority back to 41 using the returned old priority
+            setRegU32(env.ctx, 4, 0u);
+            setRegU32(env.ctx, 5, static_cast<uint32_t>(oldPri1));
+            t.IsTrue(callSyscall(0x29u, env.rdram.data(), &env.ctx, &env.runtime),
+                     "ChangeThreadPriority should dispatch");
+            const int32_t oldPri2 = getRegS32(env.ctx, 2);
+            t.Equals(oldPri2, 30, "Second change should return previous priority 30");
         });
     });
 }

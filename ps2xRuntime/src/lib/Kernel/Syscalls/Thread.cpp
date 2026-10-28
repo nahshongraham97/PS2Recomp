@@ -134,7 +134,7 @@ namespace ps2_syscalls
                           << " priority=" << priority << " result=" << result
                           << " old=" << oldPriority << std::endl;
             }
-            setReturnS32(ctx, result);
+            setReturnS32(ctx, result < 0 ? result : oldPriority);
             ee.transferIfRequested(interruptSafe);
         }
 

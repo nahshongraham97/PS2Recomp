@@ -161,6 +161,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
         m_events.clear();
         m_deadlines.clear();
         m_pendingInvocations.clear();
+    m_deferredInvocations.clear();
+    m_nextDeferredRpcId = 0;
     }
     m_eventSequence = 0;
     m_invocationSequence = 0;
@@ -1462,6 +1464,16 @@ int EeScheduler::cancelAlarm(int id)
     return KE_OK;
 }
 
+void EeScheduler::queueDeferredInvocation(GuestInvocation invocation, uint64_t delayCycles)
+{
+    assertExecutor();
+    const uint64_t deadlineCycle = m_eeCycle + (delayCycles > 0u ? delayCycles : 1u);
+    const auto hostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(delayCycles);
+    const uint32_t id = ++m_nextDeferredRpcId;
+    m_deferredInvocations.emplace(id, std::move(invocation));
+    scheduleEvent(deadlineCycle, hostDeadline, EeEvent{EeEventType::RpcCallback, id, 0});
+}
+
 void EeScheduler::queueInvocation(GuestInvocation invocation)
 {
     assertExecutor();
@@ -2599,6 +2611,17 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::Dmac:
         break;
+    case EeEventType::RpcCallback:
+    {
+        auto it = m_deferredInvocations.find(event.id);
+        if (it != m_deferredInvocations.end())
+        {
+            GuestInvocation inv = std::move(it->second);
+            m_deferredInvocations.erase(it);
+            queueInvocation(std::move(inv));
+        }
+        break;
+    }
     case EeEventType::Alarm:
     {
         auto it = m_alarms.find(static_cast<int>(event.id));

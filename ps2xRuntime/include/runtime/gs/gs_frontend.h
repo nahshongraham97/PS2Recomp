@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "runtime/gs/gs_backend.h"
+#include "runtime/gs/ps2_gif_arbiter.h"
 
 struct GSDebugSnapshot
 {
@@ -48,6 +49,21 @@ enum class GSDebugEventKind : uint8_t
     Draw = 2,
     Transfer = 3,
     Present = 4,
+};
+
+enum class GifPathTransferState : uint8_t
+{
+    Idle = 0,
+    ImageContinuation = 1,
+};
+
+struct GifPathState
+{
+    GifPathTransferState state = GifPathTransferState::Idle;
+    uint32_t remainingImageBytes = 0u;
+    uint32_t totalImageBytes = 0u;
+    uint64_t lastTagLo = 0u;
+    uint64_t lastTagHi = 0u;
 };
 
 struct GSDebugHistoryEntry
@@ -106,7 +122,11 @@ public:
     void reset();
     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
 
-    void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
+    void processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+    {
+        processGIFPacket(GifPathId::Path3, data, sizeBytes);
+    }
+    void processGIFPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes);
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     void uploadImageNative(uint64_t bitbltbuf,
                            uint64_t trxpos,
@@ -210,6 +230,15 @@ private:
     GSTrxReg m_trxreg{};
     uint32_t m_trxdir = 3;
 
+
+    GifPathState &getPathState(GifPathId pathId)
+    {
+        const size_t idx = static_cast<size_t>(pathId);
+        if (idx < m_pathStates.size())
+            return m_pathStates[idx];
+        return m_pathStates[3];
+    }
+    std::array<GifPathState, 4> m_pathStates{};
 
     static constexpr int kMaxVerts = 6;
     GSVertex m_vtxQueue[kMaxVerts];

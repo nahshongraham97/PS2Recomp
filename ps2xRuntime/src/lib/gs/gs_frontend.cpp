@@ -162,6 +162,10 @@ void GS::reset()
     m_preferredDisplaySourceFrame = {};
     m_preferredDisplayDestFbp = 0;
     m_hasPreferredDisplaySource = false;
+    for (auto &ps : m_pathStates)
+    {
+        ps = GifPathState{};
+    }
     if (m_backend)
     {
         m_backend->Flush();
@@ -641,45 +645,46 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     return true;
 }
 
-void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+void GS::processGIFPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
         return;
 
-    if (tryProcessNativeImageUploadPacket(data, sizeBytes))
-        return;
+    GifPathState &pathState = getPathState(pathId);
+    uint32_t offset = 0;
 
-    const GSTransferSnapshot transfer = m_backend ? m_backend->GetTransferSnapshot() : GSTransferSnapshot{};
-    if (transfer.direction == 0u && transfer.copiedPixels < transfer.totalPixels)
+    if (pathState.state == GifPathTransferState::ImageContinuation && pathState.remainingImageBytes > 0u)
     {
-        const uint64_t tagLo = loadLE64(data);
-        const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
-        if (nloop == 0u)
+        const uint32_t chunk = std::min(sizeBytes, pathState.remainingImageBytes);
+        processImageData(data, chunk);
+        pathState.remainingImageBytes -= chunk;
+        offset = chunk;
+        if (pathState.remainingImageBytes == 0u)
         {
-            static uint32_t s_rawImageTraceCount = 0u;
-            if (s_rawImageTraceCount++ < 16u)
-            {
-                std::cerr << "[gs:raw_image] Forwarding raw image packet size=" << sizeBytes
-                          << " (transfer " << transfer.copiedPixels << "/" << transfer.totalPixels
-                          << " pixels)" << std::endl;
-            }
-            processImageData(data, sizeBytes);
+            pathState.state = GifPathTransferState::Idle;
+        }
+        if (offset >= sizeBytes)
+        {
             return;
         }
     }
+
+    if (offset == 0u && tryProcessNativeImageUploadPacket(data, sizeBytes))
+        return;
 
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t packetIndex = s_debugGifPacketCount.fetch_add(1, std::memory_order_relaxed);
         if (packetIndex < 48u)
         {
-            const uint64_t tagLo = loadLE64(data);
+            const uint64_t tagLo = loadLE64(data + offset);
             const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
             const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
             uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
             if (nreg == 0u)
                 nreg = 16u;
             RUNTIME_LOG("[gs:gif] idx=" << packetIndex
+                                        << " path=" << static_cast<uint32_t>(pathId)
                                         << " size=" << sizeBytes
                                         << " nloop=" << nloop
                                         << " flg=" << static_cast<uint32_t>(flg)
@@ -690,7 +695,6 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         }
     });
 
-    uint32_t offset = 0;
     while (offset + 16 <= sizeBytes)
     {
         uint64_t tagLo = loadLE64(data + offset);
@@ -749,11 +753,23 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (flg == GIF_FMT_IMAGE)
         {
-            uint32_t imageBytes = nloop * 16;
-            if (offset + imageBytes > sizeBytes)
-                imageBytes = sizeBytes - offset;
-            processImageData(data + offset, imageBytes);
-            offset += imageBytes;
+            const uint32_t totalImageBytes = nloop * 16u;
+            const uint32_t avail = (offset < sizeBytes) ? (sizeBytes - offset) : 0u;
+            const uint32_t chunk = std::min(totalImageBytes, avail);
+            if (chunk > 0u)
+            {
+                processImageData(data + offset, chunk);
+                offset += chunk;
+            }
+            if (chunk < totalImageBytes)
+            {
+                pathState.state = GifPathTransferState::ImageContinuation;
+                pathState.remainingImageBytes = totalImageBytes - chunk;
+                pathState.totalImageBytes = totalImageBytes;
+                pathState.lastTagLo = tagLo;
+                pathState.lastTagHi = tagHi;
+                break;
+            }
         }
     }
 }

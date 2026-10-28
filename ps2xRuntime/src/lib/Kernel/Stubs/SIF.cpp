@@ -630,6 +630,10 @@ namespace ps2_stubs
             uint32_t endFunction = 0u;
             uint32_t endParameter = 0u;
             (void)readGuestWord(rdram, clientAddress + 8u, semaWord);
+            if (semaWord == 0xFFFFFFFFu)
+            {
+                (void)readGuestWord(rdram, clientAddress + 0x28u, semaWord);
+            }
             (void)readGuestWord(rdram, clientAddress + 0x1Cu, endFunction);
             (void)readGuestWord(rdram, clientAddress + 0x20u, endParameter);
             std::cout << "[Armageddon HLE RPC request] source_pc=0x" << std::hex << sourcePc
@@ -657,6 +661,10 @@ namespace ps2_stubs
             if (!readGuestWord(rdram, clientAddress + 8u, semaWord) ||
                 !readGuestWord(rdram, clientAddress + 0x1Cu, endFunction))
                 return false;
+            if (semaWord == 0xFFFFFFFFu)
+            {
+                (void)readGuestWord(rdram, clientAddress + 0x28u, semaWord);
+            }
 
             std::array<uint8_t, 64u> reply{};
             std::memcpy(reply.data(), requestBytes.data(), 4u);
@@ -724,7 +732,15 @@ namespace ps2_stubs
                     };
                     try
                     {
-                        runtime->eeScheduler().queueInvocation(std::move(callback));
+                        if ((mode & 1u) != 0u)
+                        {
+                            constexpr uint64_t kDefaultRpcDeferCycles = 4960000ull;
+                            runtime->eeScheduler().queueDeferredInvocation(std::move(callback), kDefaultRpcDeferCycles);
+                        }
+                        else
+                        {
+                            runtime->eeScheduler().queueInvocation(std::move(callback));
+                        }
                     }
                     catch (...)
                     {
