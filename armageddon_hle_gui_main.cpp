@@ -1,4 +1,5 @@
 #include "ps2_runtime.h"
+#include "runtime/ee_scheduler.h"
 
 #include <algorithm>
 #include <array>
@@ -804,6 +805,226 @@ namespace
     }
 }
 
+
+
+
+
+// VTable dispatch functions for Midway Process / Fiber coroutines:
+static void FUN_0012d830_hle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    (void)rdram; (void)runtime;
+    SET_GPR_U32(ctx, 2, 0u); // $v0 = 0
+    ctx->pc = GPR_U32(ctx, 31);
+}
+
+static void FUN_0012d850_hle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    (void)rdram; (void)runtime;
+    SET_GPR_U32(ctx, 2, 0u); // $v0 = 0
+    ctx->pc = GPR_U32(ctx, 31);
+}
+
+static void FUN_0012d880_hle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    (void)rdram; (void)runtime;
+    SET_GPR_U32(ctx, 2, GPR_U32(ctx, 4)); // $v0 = $a0 (this)
+    ctx->pc = GPR_U32(ctx, 31);
+}
+
+static void FUN_0012e4a0_hle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t gp = GPR_U32(ctx, 28);
+    WRITE32(gp - 0x61bc, GPR_U32(ctx, 29));
+    SET_GPR_U32(ctx, 29, READ32(gp - 0x61b8));
+    ctx->pc = GPR_U32(ctx, 31);
+}
+
+static void FUN_0012e4b0_hle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t gp = GPR_U32(ctx, 28);
+    SET_GPR_U32(ctx, 29, READ32(gp - 0x61bc));
+    WRITE32(gp - 0x61bc, 0);
+    ctx->pc = GPR_U32(ctx, 31);
+}
+
+static void FUN_0012e410_hle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t gp = GPR_U32(ctx, 28);
+    const uint32_t curProc = READ32(gp - 0x619c);
+    if (curProc != 0)
+    {
+        WRITE32(curProc + 0xe4, GPR_U32(ctx, 31)); // resume_pc
+        WRITE32(curProc + 0xf4, GPR_U32(ctx, 29)); // saved_sp
+        const uint32_t sleepDurationBits = READ32(gp - 0x6198);
+        WRITE32(curProc + 0x0c, sleepDurationBits);
+    }
+    const uint32_t schedulerRa = READ32(gp - 0x61b4);
+    const uint32_t schedulerSp = READ32(gp - 0x61b8);
+    if (schedulerSp != 0) { SET_GPR_U32(ctx, 29, schedulerSp); }
+    ctx->pc = (schedulerRa != 0) ? schedulerRa : GPR_U32(ctx, 31);
+}
+
+static void FUN_0012e4c0_hle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t gp = GPR_U32(ctx, 28);
+    const uint32_t curProc = READ32(gp - 0x619c);
+    const uint32_t nextFunc = GPR_U32(ctx, 4); // $a0
+    const float delay = ctx->f[12]; // $f12
+
+    std::cout << "[Midway Process Dispatch] cur_proc=0x" << std::hex << curProc
+              << " next_func=0x" << nextFunc << " delay=" << std::dec << delay << std::endl;
+
+    if (curProc != 0)
+    {
+        WRITE32(curProc + 0xe0, nextFunc);
+        const uint32_t stackTop = READ32(curProc + 0xf0);
+        if (stackTop != 0)
+        {
+            SET_GPR_U32(ctx, 29, stackTop);
+            WRITE32(curProc + 0xf4, stackTop);
+        }
+    }
+
+    if (delay == 0.0f && nextFunc != 0)
+    {
+        ctx->pc = nextFunc;
+        runtime->dispatchGuestBranch(rdram, ctx, nextFunc, 0x12E4C0u, 0x12E38Cu, PS2Runtime::GuestBranchKind::DirectCall, "JALR");
+    }
+    else
+    {
+        if (curProc != 0)
+        {
+            uint32_t delayBits;
+            std::memcpy(&delayBits, &delay, sizeof(delayBits));
+            WRITE32(curProc + 0x0c, delayBits);
+            WRITE32(curProc + 0xe4, 0x0012E380u);
+        }
+        const uint32_t schedulerRa = READ32(gp - 0x61b4);
+        const uint32_t schedulerSp = READ32(gp - 0x61b8);
+        if (schedulerSp != 0) { SET_GPR_U32(ctx, 29, schedulerSp); }
+        ctx->pc = (schedulerRa != 0) ? schedulerRa : GPR_U32(ctx, 31);
+    }
+}
+
+static void FUN_0012e2f0_hle(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t gp = GPR_U32(ctx, 28);
+    WRITE32(gp - 0x61b4, GPR_U32(ctx, 31));
+    WRITE32(gp - 0x61b8, GPR_U32(ctx, 29));
+
+    const uint32_t curProc = READ32(gp - 0x619c);
+    if (curProc != 0)
+    {
+        const uint32_t procSp = READ32(curProc + 0xf4);
+        if (procSp != 0)
+        {
+            SET_GPR_U32(ctx, 29, procSp);
+        }
+        uint32_t targetPc = READ32(curProc + 0xe4);
+        if (targetPc == 0)
+        {
+            targetPc = READ32(curProc + 0xe0);
+        }
+        if (targetPc != 0)
+        {
+            ctx->pc = targetPc;
+            runtime->dispatchGuestBranch(rdram, ctx, targetPc, 0x12E2F0u, 0x12E38Cu, PS2Runtime::GuestBranchKind::DirectCall, "JR");
+            return;
+        }
+    }
+    ctx->pc = GPR_U32(ctx, 31);
+}
+
+static void FUN_0012e670_hle_full(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t listPtr = GPR_U32(ctx, 4); // $a0
+    if (listPtr == 0)
+    {
+        ctx->pc = GPR_U32(ctx, 31);
+        return;
+    }
+
+    const uint32_t gp = GPR_U32(ctx, 28);
+    uint32_t node = READ32(listPtr);
+
+    while (node != 0)
+    {
+        const uint32_t proc = READ32(node);
+        const uint32_t nodeGen = READ32(node + 16);
+        const uint32_t procGen = (proc != 0) ? READ32(proc + 4) : 0;
+
+        if (nodeGen == procGen && proc != 0)
+        {
+            WRITE32(gp - 0x61a0, 0); // 0x64df50 = 0
+            WRITE32(gp - 0x619c, proc); // 0x64df54 = proc (cur_proc)
+
+            // Decrement sleep timer
+            const uint32_t procFlags = READ32(proc + 0xd0);
+            float sleepTimer;
+            uint32_t timerBits = READ32(proc + 0x0c);
+            std::memcpy(&sleepTimer, &timerBits, sizeof(sleepTimer));
+
+            if (procFlags & 0x08)
+            {
+                float step;
+                uint32_t stepBits = READ32(gp - 0x625c); // 0x64de94
+                std::memcpy(&step, &stepBits, sizeof(step));
+                sleepTimer -= step;
+            }
+            else
+            {
+                sleepTimer -= 1.0f;
+            }
+
+            std::memcpy(&timerBits, &sleepTimer, sizeof(timerBits));
+            WRITE32(proc + 0x0c, timerBits);
+
+            if (sleepTimer <= 0.0f)
+            {
+                const uint32_t vtable = READ32(proc);
+                uint32_t targetPc = 0;
+                if (vtable != 0)
+                {
+                    const uint32_t runFunc = READ32(vtable + 0x10);
+                    if (runFunc != 0 && runFunc != 0x0012E2F0u)
+                    {
+                        targetPc = runFunc;
+                    }
+                }
+                if (targetPc == 0)
+                {
+                    targetPc = READ32(proc + 0xe4); // resume_pc
+                }
+                if (targetPc == 0)
+                {
+                    targetPc = READ32(proc + 0xe0); // next_func
+                }
+
+                if (targetPc != 0)
+                {
+                    WRITE32(gp - 0x61b4, 0x0012E8E4u); // return RA
+                    WRITE32(gp - 0x61b8, GPR_U32(ctx, 29)); // return SP
+                    ctx->pc = targetPc;
+                    runtime->dispatchGuestBranch(rdram, ctx, targetPc, 0x0012E8DCu, 0x0012E8E4u, PS2Runtime::GuestBranchKind::DirectCall, "JALR");
+                }
+            }
+            node = READ32(node + 4);
+        }
+        else
+        {
+            uint32_t nextNode = READ32(node + 4);
+            WRITE32(node + 16, 1);
+            SET_GPR_U32(ctx, 4, node);
+            runtime->dispatchGuestBranch(rdram, ctx, 0x0012FA00u, 0x0012E6CCu, 0x0012E6D4u, PS2Runtime::GuestBranchKind::DirectCall, "JAL");
+            node = nextNode;
+        }
+    }
+
+    WRITE32(gp - 0x619c, 0); // cur_proc = NULL
+    WRITE32(gp - 0x61a4, 0); // 0x64df4c = 0
+    ctx->pc = GPR_U32(ctx, 31);
+}
+
 int main(int argc, char **argv)
 {
 #if defined(PS2X_ARMAGEDDON_SUPPLEMENTAL_REGISTRATION)
@@ -1339,6 +1560,32 @@ int main(int argc, char **argv)
             return 27;
         }
     }
+
+
+    const std::pair<uint32_t, PS2Runtime::RecompiledFunction> processVtableEntries[] = {
+        {0x0012D830u, FUN_0012d830_hle},
+        {0x0012D850u, FUN_0012d850_hle},
+        {0x0012D880u, FUN_0012d880_hle},
+        {0x0012E2F0u, FUN_0012e2f0_hle},
+        {0x0012E410u, FUN_0012e410_hle},
+        {0x0012E4A0u, FUN_0012e4a0_hle},
+        {0x0012E4B0u, FUN_0012e4b0_hle},
+        {0x0012E4C0u, FUN_0012e4c0_hle},
+        {0x0012E670u, FUN_0012e670_hle_full},
+        {0x0012E6D4u, FUN_0012e670_hle_full},
+    };
+    for (const auto &entry : processVtableEntries)
+    {
+        if (!runtime.replaceFunction(entry.first, entry.second))
+        {
+            std::cerr << "Failed to register Midway process entry at 0x"
+                      << std::hex << entry.first << '\n';
+            return 28;
+        }
+    }
+    std::cout << "[Armageddon HLE process scheduler] registered entries="
+              << sizeof(processVtableEntries) / sizeof(processVtableEntries[0]) << '\n';
+
     std::cout << "[Armageddon HLE ELF wrapper registration]"
               << " range=[0x33f060,0x33f150) entries=9\n";
     const bool heapProbeInstalled =
