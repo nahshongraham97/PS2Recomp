@@ -1834,74 +1834,188 @@ void register_ps2_runtime_kernel_tests()
             using namespace armageddon_hle;
             t.Equals(sizeof(PadDataNew), 128ULL, "PadDataNew must be exactly 128 bytes");
             t.Equals(sizeof(PadAreaNew), 256ULL, "PadAreaNew must be exactly 256 bytes");
+            t.Equals(offsetof(PadDataNew, data), 0x00ULL, "data offset must be 0x00");
+            t.Equals(offsetof(PadDataNew, actDirData), 0x20ULL, "actDirData offset must be 0x20");
+            t.Equals(offsetof(PadDataNew, actAlignData), 0x28ULL, "actAlignData offset must be 0x28");
+            t.Equals(offsetof(PadDataNew, actData), 0x30ULL, "actData offset must be 0x30");
             t.Equals(offsetof(PadDataNew, modeTable), 0x50ULL, "modeTable offset must be 0x50");
+            t.Equals(offsetof(PadDataNew, frame), 0x58ULL, "frame offset must be 0x58");
+            t.Equals(offsetof(PadDataNew, findPadRetries), 0x5CULL, "findPadRetries offset must be 0x5C");
+            t.Equals(offsetof(PadDataNew, length), 0x60ULL, "length offset must be 0x60");
             t.Equals(offsetof(PadDataNew, modeConfig), 0x64ULL, "modeConfig offset must be 0x64");
             t.Equals(offsetof(PadDataNew, modeCurId), 0x65ULL, "modeCurId offset must be 0x65");
+            t.Equals(offsetof(PadDataNew, model), 0x66ULL, "model offset must be 0x66");
+            t.Equals(offsetof(PadDataNew, buttonDataReady), 0x67ULL, "buttonDataReady offset must be 0x67");
+            t.Equals(offsetof(PadDataNew, nrOfModes), 0x68ULL, "nrOfModes offset must be 0x68");
+            t.Equals(offsetof(PadDataNew, modeCurOffs), 0x69ULL, "modeCurOffs offset must be 0x69");
+            t.Equals(offsetof(PadDataNew, nrOfActuators), 0x6AULL, "nrOfActuators offset must be 0x6A");
+            t.Equals(offsetof(PadDataNew, numActComb), 0x6BULL, "numActComb offset must be 0x6B");
+            t.Equals(offsetof(PadDataNew, val_c6), 0x6CULL, "val_c6 offset must be 0x6C");
             t.Equals(offsetof(PadDataNew, mode), 0x6DULL, "mode offset must be 0x6D");
             t.Equals(offsetof(PadDataNew, lock), 0x6EULL, "lock offset must be 0x6E");
+            t.Equals(offsetof(PadDataNew, actDirSize), 0x6FULL, "actDirSize offset must be 0x6F");
             t.Equals(offsetof(PadDataNew, state), 0x70ULL, "state offset must be 0x70");
             t.Equals(offsetof(PadDataNew, reqState), 0x71ULL, "reqState offset must be 0x71");
+            t.Equals(offsetof(PadDataNew, currentTask), 0x72ULL, "currentTask offset must be 0x72");
+            t.Equals(offsetof(PadDataNew, runTask), 0x73ULL, "runTask offset must be 0x73");
+            t.Equals(offsetof(PadDataNew, stat70bit), 0x74ULL, "stat70bit offset must be 0x74");
 
             PadAreaNew area{};
-            populatePadBuffer(area.buffers[0], 1u, 1u, PAD_STATE_STABLE, PAD_RSTAT_COMPLETE);
-            populatePadBuffer(area.buffers[1], 0u, 0u, PAD_STATE_STABLE, PAD_RSTAT_COMPLETE);
+            populatePadBuffer(area.buffers[0], 1u, PAD_STATE_STABLE, PAD_RSTAT_COMPLETE);
+            populatePadBuffer(area.buffers[1], 0u, PAD_STATE_STABLE, PAD_RSTAT_COMPLETE);
 
-            t.Equals(static_cast<uint32_t>(area.buffers[0].state), static_cast<uint32_t>(PAD_STATE_STABLE), "Buffer 0 state must be STABLE (6)");
-            t.Equals(static_cast<uint32_t>(area.buffers[0].reqState), static_cast<uint32_t>(PAD_RSTAT_COMPLETE), "Buffer 0 reqState must be COMPLETE (0)");
-            t.Equals(static_cast<uint32_t>(area.buffers[0].modeCurId), 0x79u, "Buffer 0 modeCurId must be DualShock 2 (0x79)");
-            t.Equals(static_cast<uint32_t>(area.buffers[0].lock), 3u, "Buffer 0 lock must be 3");
+            // Raw byte inspection of buffer 0 without struct field accessors
+            const uint8_t *raw0 = reinterpret_cast<const uint8_t *>(&area.buffers[0]);
+            t.Equals(static_cast<uint32_t>(raw0[0x00]), 0x00u, "Raw data[0] terminal must be 0");
+            t.Equals(static_cast<uint32_t>(raw0[0x01]), 0x79u, "Raw data[1] ID must be 0x79 (DualShock 2)");
+            t.Equals(static_cast<uint32_t>(raw0[0x02]), 0xFFu, "Raw data[2] buttons low must be 0xFF");
+            t.Equals(static_cast<uint32_t>(raw0[0x03]), 0xFFu, "Raw data[3] buttons high must be 0xFF");
+            t.Equals(static_cast<uint32_t>(raw0[0x04]), 0x7Fu, "Raw data[4] right analog X must be 0x7F");
+            t.Equals(static_cast<uint32_t>(raw0[0x05]), 0x7Fu, "Raw data[5] right analog Y must be 0x7F");
+            t.Equals(static_cast<uint32_t>(raw0[0x06]), 0x7Fu, "Raw data[6] left analog X must be 0x7F");
+            t.Equals(static_cast<uint32_t>(raw0[0x07]), 0x7Fu, "Raw data[7] left analog Y must be 0x7F");
+            for (size_t p = 8; p < 20; ++p)
+            {
+                t.Equals(static_cast<uint32_t>(raw0[p]), 0x00u, "Raw pressure sensors must be 0");
+            }
+            uint16_t modeTable0 = 0;
+            std::memcpy(&modeTable0, raw0 + 0x50, sizeof(modeTable0));
+            t.Equals(static_cast<uint32_t>(modeTable0), 7u, "Raw modeTable[0] must be 7");
+            uint32_t frame0 = 0;
+            std::memcpy(&frame0, raw0 + 0x58, sizeof(frame0));
+            t.Equals(frame0, 1u, "Raw frame must be 1");
+            uint32_t len0 = 0;
+            std::memcpy(&len0, raw0 + 0x60, sizeof(len0));
+            t.Equals(len0, 32u, "Raw length must be 32");
+            t.Equals(static_cast<uint32_t>(raw0[0x64]), 2u, "Raw modeConfig must be 2");
+            t.Equals(static_cast<uint32_t>(raw0[0x65]), 0x79u, "Raw modeCurId must be 0x79");
+            t.Equals(static_cast<uint32_t>(raw0[0x6E]), 3u, "Raw lock must be 3");
+            t.Equals(static_cast<uint32_t>(raw0[0x70]), static_cast<uint32_t>(PAD_STATE_STABLE), "Raw state at 0x70 must be STABLE (6)");
+            t.Equals(static_cast<uint32_t>(raw0[0x71]), static_cast<uint32_t>(PAD_RSTAT_COMPLETE), "Raw reqState at 0x71 must be COMPLETE (0)");
 
-            t.Equals(static_cast<uint32_t>(area.buffers[1].state), static_cast<uint32_t>(PAD_STATE_STABLE), "Buffer 1 state must be STABLE (6)");
-            t.Equals(static_cast<uint32_t>(area.buffers[1].reqState), static_cast<uint32_t>(PAD_RSTAT_COMPLETE), "Buffer 1 reqState must be COMPLETE (0)");
-            t.Equals(static_cast<uint32_t>(area.buffers[1].modeCurId), 0x79u, "Buffer 1 modeCurId must be DualShock 2 (0x79)");
+            // Raw byte inspection of buffer 1
+            const uint8_t *raw1 = reinterpret_cast<const uint8_t *>(&area.buffers[1]);
+            uint32_t frame1 = 0;
+            std::memcpy(&frame1, raw1 + 0x58, sizeof(frame1));
+            t.Equals(frame1, 0u, "Buffer 1 raw frame must be 0");
+            t.Equals(static_cast<uint32_t>(raw1[0x70]), static_cast<uint32_t>(PAD_STATE_STABLE), "Buffer 1 raw state at 0x70 must be STABLE (6)");
+            t.Equals(static_cast<uint32_t>(raw1[0x71]), static_cast<uint32_t>(PAD_RSTAT_COMPLETE), "Buffer 1 raw reqState at 0x71 must be COMPLETE (0)");
+            t.IsTrue(frame0 > frame1, "Double-buffer: buffer 0 newer than buffer 1 for padGetDmaStrNew");
         });
 
-        tc.Run("EeScheduler queueDeferredInvocation queues event without immediate execution", [](TestCase &t)
+        tc.Run("EeScheduler queueDeferredAction executes full RPC completion after delay", [](TestCase &t)
         {
             TestEnv env;
             R5900Context ctx{};
             ctx.pc = 0x00100000u;
             env.runtime.eeScheduler().reset(env.rdram.data(), ctx);
 
-            GuestInvocation inv{};
-            inv.kind = GuestInvocationKind::RpcCallback;
-            inv.tag = 0x9999u;
-            inv.context.pc = 0x00200000u;
+            bool actionExecuted = false;
+            env.runtime.eeScheduler().queueDeferredAction([&]()
+            {
+                actionExecuted = true;
+            }, 5000000ull);
 
-            env.runtime.eeScheduler().queueDeferredInvocation(std::move(inv), 5000000ull);
-            t.IsFalse(env.runtime.eeScheduler().hasInvocation(GuestInvocationKind::RpcCallback, 0x9999u),
-                      "Deferred invocation should not be in active thread invocations immediately");
+            t.IsFalse(actionExecuted, "Deferred action should not execute immediately");
         });
 
-        tc.Run("GS per-path persistent IMAGE parser handles split transfers", [](TestCase &t)
+        tc.Run("GS per-path persistent IMAGE parser transfers verified bytes and isolates paths", [](TestCase &t)
         {
+            class MockGsBackend final : public GSRasterBackend
+            {
+            public:
+                std::vector<uint8_t> uploadedBytes;
+
+                void Initialize(uint8_t *, uint32_t) override {}
+                void Reset() override { uploadedBytes.clear(); }
+                void Submit(const GSPrimitiveBatch &) override {}
+                void LoadClut(const GSTex0Reg &, const GSTexClutReg &) override {}
+                void BeginTransfer(const GSTransferCommand &) override {}
+                void UploadImage(const uint8_t *data, uint32_t sizeBytes) override
+                {
+                    if (data && sizeBytes > 0)
+                    {
+                        uploadedBytes.insert(uploadedBytes.end(), data, data + sizeBytes);
+                    }
+                }
+                void Flush() override {}
+                void TextureFlush() override {}
+                void Sync(GSSyncReason) override {}
+                PresentationFrame Present(const GSPresentationRequest &) override { return {}; }
+                bool ClearFramebuffer(const GSContext &, uint32_t) override { return true; }
+                uint32_t ConsumeLocalToHostBytes(uint8_t *, uint32_t) override { return 0; }
+                uint32_t ReadVram(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) const override { return 0; }
+                void WriteVram(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) override {}
+                void SnapshotVram(std::vector<uint8_t> &) const override {}
+                GSTransferSnapshot GetTransferSnapshot() const override { return {}; }
+            };
+
             GS gs;
             std::vector<uint8_t> vram(4 * 1024 * 1024, 0);
             gs.init(vram.data(), static_cast<uint32_t>(vram.size()));
 
-            // Construct split IMAGE transfer:
-            // Total 2 quadwords (32 bytes). Packet 1 has GIFtag (16 bytes) + 1 QW (16 bytes).
-            // Packet 2 has the remaining 1 QW (16 bytes).
-            // GIFtag: NLOOP = 2, FLG = 2 (IMAGE), PRE = 0, NREG = 0
-            // tagLo: (2 & 0x7FFF) | (2ULL << 58)
-            const uint64_t tagLo = 2ULL | (2ULL << 58);
-            const uint64_t tagHi = 0ULL;
+            auto mockBackend = std::make_unique<MockGsBackend>();
+            MockGsBackend *rawMock = mockBackend.get();
+            gs.setRasterBackend(std::move(mockBackend));
 
+            // Test 1: Split IMAGE transfer (FLG = 2) on Path 1 across 2 packets
+            // Total 2 quadwords (32 bytes). Packet 1: GIFtag (16 bytes) + 16 bytes image data (0xAA).
+            // Packet 2: 16 bytes image data (0xBB).
+            const uint64_t tagLo1 = 2ULL | (2ULL << 58); // NLOOP = 2, FLG = 2 (IMAGE)
+            const uint64_t tagHi1 = 0ULL;
             std::array<uint8_t, 32> packet1{};
-            std::memcpy(packet1.data(), &tagLo, 8);
-            std::memcpy(packet1.data() + 8, &tagHi, 8);
-            std::memset(packet1.data() + 16, 0xAA, 16); // first 16 bytes image payload
+            std::memcpy(packet1.data(), &tagLo1, 8);
+            std::memcpy(packet1.data() + 8, &tagHi1, 8);
+            std::memset(packet1.data() + 16, 0xAA, 16);
 
             std::array<uint8_t, 16> packet2{};
-            std::memset(packet2.data(), 0xBB, 16); // second 16 bytes image payload
+            std::memset(packet2.data(), 0xBB, 16);
 
-            gs.processGIFPacket(GifPathId::Path3, packet1.data(), static_cast<uint32_t>(packet1.size()));
+            gs.processGIFPacket(GifPathId::Path1, packet1.data(), static_cast<uint32_t>(packet1.size()));
 
-            // Send packet 2 on Path3
-            gs.processGIFPacket(GifPathId::Path3, packet2.data(), static_cast<uint32_t>(packet2.size()));
+            // Verify Path 1 entered ImageContinuation with 16 bytes remaining
+            const auto &path1State = gs.getPathState(GifPathId::Path1);
+            t.Equals(static_cast<uint32_t>(path1State.state), static_cast<uint32_t>(GifPathTransferState::ImageContinuation),
+                     "Path 1 must be in ImageContinuation after partial packet");
+            t.Equals(path1State.remainingImageBytes, 16u, "Path 1 remainingImageBytes must be 16");
 
-            // Verify no crash, and state reset cleanly
-            t.IsTrue(true, "Split IMAGE transfer completed without error");
+            // Verify Path 3 isolation: Path 3 must still be Idle
+            const auto &path3State = gs.getPathState(GifPathId::Path3);
+            t.Equals(static_cast<uint32_t>(path3State.state), static_cast<uint32_t>(GifPathTransferState::Idle),
+                     "Path 3 must remain Idle while Path 1 has pending continuation");
+
+            // Send packet 2 on Path 1
+            gs.processGIFPacket(GifPathId::Path1, packet2.data(), static_cast<uint32_t>(packet2.size()));
+
+            // Verify Path 1 returned to Idle
+            t.Equals(static_cast<uint32_t>(path1State.state), static_cast<uint32_t>(GifPathTransferState::Idle),
+                     "Path 1 state must return to Idle after transfer completes");
+            t.Equals(path1State.remainingImageBytes, 0u, "Path 1 remainingImageBytes must be 0");
+
+            // Verify exact 32 transferred image bytes and contents in correct order
+            t.Equals(rawMock->uploadedBytes.size(), 32ULL, "Mock backend must receive exactly 32 image bytes");
+            bool bytesMatch = true;
+            for (size_t i = 0; i < 16; ++i)
+            {
+                if (rawMock->uploadedBytes[i] != 0xAA) bytesMatch = false;
+            }
+            for (size_t i = 16; i < 32; ++i)
+            {
+                if (rawMock->uploadedBytes[i] != 0xBB) bytesMatch = false;
+            }
+            t.IsTrue(bytesMatch, "Uploaded bytes must match 0xAA for chunk 1 and 0xBB for chunk 2");
+
+            // Test 2: FLG = 3 (DISABLE/raw image) transfer
+            rawMock->uploadedBytes.clear();
+            const uint64_t tagLoFlg3 = 1ULL | (3ULL << 58); // NLOOP = 1, FLG = 3
+            std::array<uint8_t, 32> packetFlg3{};
+            std::memcpy(packetFlg3.data(), &tagLoFlg3, 8);
+            std::memcpy(packetFlg3.data() + 8, &tagHi1, 8);
+            std::memset(packetFlg3.data() + 16, 0xCC, 16);
+
+            gs.processGIFPacket(GifPathId::Path2, packetFlg3.data(), static_cast<uint32_t>(packetFlg3.size()));
+            t.Equals(rawMock->uploadedBytes.size(), 16ULL, "FLG=3 must transfer 16 image bytes");
+            t.Equals(static_cast<uint32_t>(rawMock->uploadedBytes[0]), 0xCCu, "FLG=3 payload byte must be 0xCC");
         });
 
         tc.Run("ChangeThreadPriority returns previous priority", [](TestCase &t)

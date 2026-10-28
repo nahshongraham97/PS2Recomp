@@ -647,140 +647,152 @@ namespace ps2_stubs
                       << " end_parameter=0x" << endParameter
                       << std::dec << std::endl;
 
-            const ps2x::iop::RpcResult result = armageddon_hle::handleRpc(runtime, rdram, rpcRequest);
-            if (!result.handled)
+            const R5900Context callerCtx = ctx ? *ctx : R5900Context{};
+            auto completeRpc = [runtime, rdram, rpcRequest, clientAddress, packetAddress,
+                                requestBytes, packetSize, sid, rpcNumber, sourcePc, sourceRa,
+                                serverAddress, server, semaWord, endFunction, endParameter,
+                                sendAddress, sendSize, receiveAddress, receiveSize,
+                                packetSourceAddress, callerCtx]() mutable
             {
-                std::cerr << "[Armageddon HLE RPC call] no-host-handler sid=0x"
-                          << std::hex << sid << " rpc=0x" << rpcNumber
-                          << " reply_size=0x" << receiveSize
-                          << " action=fail-stop-no-synthetic-reply" << std::dec << std::endl;
-                runtime->requestStop();
-                return false;
-            }
-
-            if (!readGuestWord(rdram, clientAddress + 8u, semaWord) ||
-                !readGuestWord(rdram, clientAddress + 0x1Cu, endFunction))
-                return false;
-            if (semaWord == 0xFFFFFFFFu)
-            {
-                (void)readGuestWord(rdram, clientAddress + 0x28u, semaWord);
-            }
-
-            std::array<uint8_t, 64u> reply{};
-            std::memcpy(reply.data(), requestBytes.data(), 4u);
-            const uint32_t replyCommand = kSifCmdRpcEnd;
-            std::memcpy(reply.data() + 8u, &replyCommand, sizeof(replyCommand));
-            std::memcpy(reply.data() + 16u, requestBytes.data() + 16u, 16u);
-            const uint32_t originalCommand = kSifCmdRpcCall;
-            std::memcpy(reply.data() + 32u, &originalCommand, sizeof(originalCommand));
-            std::memcpy(reply.data() + 36u, &serverAddress, sizeof(serverAddress));
-            std::memcpy(reply.data() + 40u, &server.bufferAddress, sizeof(server.bufferAddress));
-            std::memcpy(reply.data() + 44u, &server.callbackBufferAddress, sizeof(server.callbackBufferAddress));
-
-            const bool guestCallbackQueued = dispatchSifCommand(rdram,
-                                                                runtime,
-                                                                kSifCmdRpcEnd,
-                                                                reply.data(),
-                                                                reply.size());
-            bool directCompletion = false;
-            if (!guestCallbackQueued)
-            {
-                if (endFunction != 0u)
+                const ps2x::iop::RpcResult result = armageddon_hle::handleRpc(runtime, rdram, rpcRequest);
+                if (!result.handled)
                 {
-                    uint32_t callbackFunction = endFunction;
-                    if (!runtime->hasFunction(callbackFunction) && callbackFunction >= 0x10000u &&
-                        runtime->hasFunction(callbackFunction - 0x10000u))
-                    {
-                        callbackFunction -= 0x10000u;
-                    }
-                    if (!ctx || !runtime->hasFunction(callbackFunction))
-                    {
-                        std::cerr << "[Armageddon HLE RPC call] end-callback-unresolved"
-                                  << " guest_function=0x" << std::hex << endFunction
-                                  << " client=0x" << clientAddress
-                                  << " action=fail-stop" << std::dec << std::endl;
-                        runtime->requestStop();
-                        return false;
-                    }
+                    std::cerr << "[Armageddon HLE RPC call] no-host-handler sid=0x"
+                              << std::hex << sid << " rpc=0x" << rpcNumber
+                              << " reply_size=0x" << receiveSize
+                              << " action=fail-stop-no-synthetic-reply" << std::dec << std::endl;
+                    runtime->requestStop();
+                    return;
+                }
 
-                    uint32_t recordId = 0u;
-                    std::memcpy(&recordId, requestBytes.data() + 16u, sizeof(recordId));
-                    GuestInvocation callback{};
-                    callback.kind = GuestInvocationKind::RpcCallback;
-                    callback.context = *ctx;
-                    callback.context.pc = callbackFunction;
-                    SET_GPR_U32(&callback.context, 4, endParameter);
-                    SET_GPR_U32(&callback.context, 29, runtime->eeScheduler().invocationStackTop());
-                    SET_GPR_U32(&callback.context, 31, 0u);
-                    callback.onComplete = [runtime, rdram, clientAddress, packetAddress,
-                                           recordId, semaWord, sid, rpcNumber](const R5900Context &, R5900Context &)
+                if (!readGuestWord(rdram, clientAddress + 8u, semaWord) ||
+                    !readGuestWord(rdram, clientAddress + 0x1Cu, endFunction))
+                {
+                    return;
+                }
+                if (semaWord == 0xFFFFFFFFu)
+                {
+                    (void)readGuestWord(rdram, clientAddress + 0x28u, semaWord);
+                }
+
+                std::array<uint8_t, 64u> reply{};
+                std::memcpy(reply.data(), requestBytes.data(), 4u);
+                const uint32_t replyCommand = kSifCmdRpcEnd;
+                std::memcpy(reply.data() + 8u, &replyCommand, sizeof(replyCommand));
+                std::memcpy(reply.data() + 16u, requestBytes.data() + 16u, 16u);
+                const uint32_t originalCommand = kSifCmdRpcCall;
+                std::memcpy(reply.data() + 32u, &originalCommand, sizeof(originalCommand));
+                std::memcpy(reply.data() + 36u, &serverAddress, sizeof(serverAddress));
+                std::memcpy(reply.data() + 40u, &server.bufferAddress, sizeof(server.bufferAddress));
+                std::memcpy(reply.data() + 44u, &server.callbackBufferAddress, sizeof(server.callbackBufferAddress));
+
+                const bool guestCallbackQueued = dispatchSifCommand(rdram,
+                                                                    runtime,
+                                                                    kSifCmdRpcEnd,
+                                                                    reply.data(),
+                                                                    reply.size());
+                bool directCompletion = false;
+                if (!guestCallbackQueued)
+                {
+                    if (endFunction != 0u)
                     {
-                        const bool clientCleared = writeGuestWord(rdram, clientAddress, 0u);
-                        const bool packetReleased = writeGuestWord(rdram, packetAddress + 16u, recordId & ~1u);
-                        bool semaphoreSignaled = false;
-                        if (static_cast<int32_t>(semaWord) >= 0)
+                        uint32_t callbackFunction = endFunction;
+                        if (!runtime->hasFunction(callbackFunction) && callbackFunction >= 0x10000u &&
+                            runtime->hasFunction(callbackFunction - 0x10000u))
                         {
-                            semaphoreSignaled = runtime->eeScheduler().signalSemaphore(
-                                static_cast<int32_t>(semaWord), true) >= 0;
+                            callbackFunction -= 0x10000u;
                         }
-                        std::cout << "[Armageddon HLE RPC callback completion] sid=0x" << std::hex << sid
-                                  << " rpc=0x" << rpcNumber << " client=0x" << clientAddress
-                                  << " client_cleared=" << (clientCleared ? "true" : "false")
-                                  << " packet_released=" << (packetReleased ? "true" : "false")
-                                  << " semaphore_signaled=" << (semaphoreSignaled ? "true" : "false")
-                                  << std::dec << std::endl;
-                    };
-                    try
-                    {
-                        if ((mode & 1u) != 0u)
+                        if (!runtime->hasFunction(callbackFunction))
                         {
-                            constexpr uint64_t kDefaultRpcDeferCycles = 4960000ull;
-                            runtime->eeScheduler().queueDeferredInvocation(std::move(callback), kDefaultRpcDeferCycles);
+                            std::cerr << "[Armageddon HLE RPC call] end-callback-unresolved"
+                                      << " guest_function=0x" << std::hex << endFunction
+                                      << " client=0x" << clientAddress
+                                      << " action=fail-stop" << std::dec << std::endl;
+                            runtime->requestStop();
+                            return;
                         }
-                        else
+
+                        uint32_t recordId = 0u;
+                        std::memcpy(&recordId, requestBytes.data() + 16u, sizeof(recordId));
+                        GuestInvocation callback{};
+                        callback.kind = GuestInvocationKind::RpcCallback;
+                        callback.context = callerCtx;
+                        callback.context.pc = callbackFunction;
+                        SET_GPR_U32(&callback.context, 4, endParameter);
+                        SET_GPR_U32(&callback.context, 29, runtime->eeScheduler().invocationStackTop());
+                        SET_GPR_U32(&callback.context, 31, 0u);
+                        callback.onComplete = [runtime, rdram, clientAddress, packetAddress,
+                                               recordId, semaWord, sid, rpcNumber](const R5900Context &, R5900Context &)
+                        {
+                            const bool clientCleared = writeGuestWord(rdram, clientAddress, 0u);
+                            const bool packetReleased = writeGuestWord(rdram, packetAddress + 16u, recordId & ~1u);
+                            bool semaphoreSignaled = false;
+                            if (static_cast<int32_t>(semaWord) >= 0)
+                            {
+                                semaphoreSignaled = runtime->eeScheduler().signalSemaphore(
+                                    static_cast<int32_t>(semaWord), true) >= 0;
+                            }
+                            std::cout << "[Armageddon HLE RPC callback completion] sid=0x" << std::hex << sid
+                                      << " rpc=0x" << rpcNumber << " client=0x" << clientAddress
+                                      << " client_cleared=" << (clientCleared ? "true" : "false")
+                                      << " packet_released=" << (packetReleased ? "true" : "false")
+                                      << " semaphore_signaled=" << (semaphoreSignaled ? "true" : "false")
+                                      << std::dec << std::endl;
+                        };
+                        try
                         {
                             runtime->eeScheduler().queueInvocation(std::move(callback));
                         }
+                        catch (...)
+                        {
+                            std::cerr << "[Armageddon HLE RPC call] end-callback-queue-failed"
+                                      << " guest_function=0x" << std::hex << callbackFunction
+                                      << " sid=0x" << sid << " rpc=0x" << rpcNumber
+                                      << " action=fail-stop" << std::dec << std::endl;
+                            runtime->requestStop();
+                            return;
+                        }
                     }
-                    catch (...)
+                    else
                     {
-                        std::cerr << "[Armageddon HLE RPC call] end-callback-queue-failed"
-                                  << " guest_function=0x" << std::hex << callbackFunction
-                                  << " sid=0x" << sid << " rpc=0x" << rpcNumber
-                                  << " action=fail-stop" << std::dec << std::endl;
-                        runtime->requestStop();
-                        return false;
+                        (void)writeGuestWord(rdram, clientAddress, 0u); // _request_end clears hdr.pkt_addr
+                        uint32_t recordId = 0u;
+                        std::memcpy(&recordId, requestBytes.data() + 16u, sizeof(recordId));
+                        (void)writeGuestWord(rdram, packetAddress + 16u, recordId & ~1u); // release RPC packet
+                        if (static_cast<int32_t>(semaWord) >= 0)
+                            directCompletion = runtime->eeScheduler().signalSemaphore(static_cast<int32_t>(semaWord), true) >= 0;
                     }
                 }
-                else
-                {
-                    (void)writeGuestWord(rdram, clientAddress, 0u); // _request_end clears hdr.pkt_addr
-                    uint32_t recordId = 0u;
-                    std::memcpy(&recordId, requestBytes.data() + 16u, sizeof(recordId));
-                    (void)writeGuestWord(rdram, packetAddress + 16u, recordId & ~1u); // release RPC packet
-                    if (static_cast<int32_t>(semaWord) >= 0)
-                        directCompletion = runtime->eeScheduler().signalSemaphore(static_cast<int32_t>(semaWord), true) >= 0;
-                }
+
+                std::cout << "[Armageddon HLE RPC call completion] sid=0x" << std::hex << sid
+                          << " source_pc=0x" << sourcePc << " source_ra=0x" << sourceRa
+                          << " rpc=0x" << rpcNumber << " client=0x" << clientAddress
+                          << " server=0x" << serverAddress << " send=0x" << sendAddress
+                          << "/0x" << sendSize << " recv=0x" << receiveAddress << "/0x" << receiveSize
+                          << " reply_size=0x" << receiveSize << " reply_packet_size=0x40"
+                          << " client_sema=0x" << semaWord
+                          << " direct_completion=" << (directCompletion ? "true" : "false")
+                          << " result=" << (result.handled ? "handled" : "unhandled")
+                          << " reply=RPC_END route=" << (guestCallbackQueued ? "guest-command-handler-8"
+                                                            : (endFunction != 0u ? "guest-end-callback-queued"
+                                                            : (directCompletion ? "documented-host-completion-fallback" : "host-completion-failed")))
+                          << " end_function=0x" << endFunction
+                          << " packet_source=0x" << packetSourceAddress
+                          << std::dec << std::endl;
+            };
+
+            if ((mode & 1u) != 0u)
+            {
+                constexpr uint64_t kDefaultRpcDeferCycles = 4960000ull;
+                runtime->eeScheduler().queueDeferredAction(std::move(completeRpc), kDefaultRpcDeferCycles);
+                return true;
+            }
+            else
+            {
+                completeRpc();
+                return true;
             }
 
-            std::cout << "[Armageddon HLE RPC call completion] sid=0x" << std::hex << sid
-                      << " source_pc=0x" << sourcePc << " source_ra=0x" << sourceRa
-                      << " rpc=0x" << rpcNumber << " client=0x" << clientAddress
-                      << " server=0x" << serverAddress << " send=0x" << sendAddress
-                      << "/0x" << sendSize << " recv=0x" << receiveAddress << "/0x" << receiveSize
-                      << " reply_size=0x" << receiveSize << " reply_packet_size=0x40"
-                      << " client_sema=0x" << semaWord
-                      << " direct_completion=" << (directCompletion ? "true" : "false")
-                      << " result=handled reply=RPC_END route="
-                      << (guestCallbackQueued ? "guest-command-handler-8"
-                                             : (endFunction != 0u
-                                                    ? "guest-end-callback-queued"
-                                                    : (directCompletion || static_cast<int32_t>(semaWord) < 0
-                                                    ? "documented-host-completion-fallback"
-                                                    : "host-completion-failed")))
-                      << " end_function=0x" << endFunction
-                      << " packet_source=0x" << packetSourceAddress << std::dec << std::endl;
-            return guestCallbackQueued || endFunction != 0u || directCompletion || static_cast<int32_t>(semaWord) < 0;
         }
     }
 

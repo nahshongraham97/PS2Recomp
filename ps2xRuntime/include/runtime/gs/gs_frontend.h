@@ -160,6 +160,16 @@ public:
     bool clearActiveFramebuffer(uint32_t rgba);
     uint64_t nativeImageUploadCount() const { return m_nativeImageUploadCount; }
     uint64_t nativePackedGIFPacketCount() const { return m_nativePackedGIFPacketCount; }
+    GifPathState &getPathState(GifPathId pathId)
+    {
+        const size_t index = static_cast<size_t>(pathId);
+        return (index < m_pathStates.size()) ? m_pathStates[index] : m_pathStates[3];
+    }
+    const GifPathState &getPathState(GifPathId pathId) const
+    {
+        const size_t index = static_cast<size_t>(pathId);
+        return (index < m_pathStates.size()) ? m_pathStates[index] : m_pathStates[3];
+    }
 
     uint32_t consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes);
 
@@ -231,13 +241,7 @@ private:
     uint32_t m_trxdir = 3;
 
 
-    GifPathState &getPathState(GifPathId pathId)
-    {
-        const size_t idx = static_cast<size_t>(pathId);
-        if (idx < m_pathStates.size())
-            return m_pathStates[idx];
-        return m_pathStates[3];
-    }
+
     std::array<GifPathState, 4> m_pathStates{};
 
     static constexpr int kMaxVerts = 6;

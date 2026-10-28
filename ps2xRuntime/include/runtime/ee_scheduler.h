@@ -237,6 +237,7 @@ enum class EeEventType : uint8_t
     ExternalWake,
     Alarm,
     RpcCallback,
+    DeferredAction,
 };
 
 struct EeEvent
@@ -318,6 +319,7 @@ public:
     int cancelAlarm(int id);
     void queueInvocation(GuestInvocation invocation);
     void queueDeferredInvocation(GuestInvocation invocation, uint64_t delayCycles);
+    void queueDeferredAction(std::function<void()> action, uint64_t delayCycles);
     [[noreturn]] void invokeCurrent(GuestInvocation invocation);
     [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
     [[nodiscard]] bool hasInvocation(GuestInvocationKind kind, uint64_t tag) const;
@@ -446,6 +448,8 @@ private:
     std::deque<GuestInvocation> m_pendingInvocations;
     std::unordered_map<uint32_t, GuestInvocation> m_deferredInvocations;
     uint32_t m_nextDeferredRpcId = 0;
+    std::unordered_map<uint32_t, std::function<void()>> m_deferredActions;
+    uint32_t m_nextDeferredActionId = 0;
     uint64_t m_eventSequence = 0;
     uint64_t m_invocationSequence = 0;
     uint64_t m_vsyncTick = 0;

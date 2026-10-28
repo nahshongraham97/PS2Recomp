@@ -25,29 +25,41 @@
 
 namespace armageddon_hle
 {
-void populatePadBuffer(PadDataNew &buf, uint32_t frameVal, uint32_t counterVal, uint8_t state, uint8_t reqState)
+void populatePadBuffer(PadDataNew &buf, uint32_t frameVal, uint8_t state, uint8_t reqState)
 {
     std::memset(&buf, 0, sizeof(PadDataNew));
-    buf.frame = frameVal;
+    std::memset(buf.data, 0xFF, sizeof(buf.data));
+    buf.data[0] = 0x00u; // Terminal OK
+    buf.data[1] = 0x79u; // DualShock 2 ID
+    buf.data[2] = 0xFFu; // Buttons low (all unpressed)
+    buf.data[3] = 0xFFu; // Buttons high (all unpressed)
+    buf.data[4] = 0x7Fu; // Right analog X (centered)
+    buf.data[5] = 0x7Fu; // Right analog Y (centered)
+    buf.data[6] = 0x7Fu; // Left analog X (centered)
+    buf.data[7] = 0x7Fu; // Left analog Y (centered)
+    for (size_t i = 8; i < 20; ++i)
+    {
+        buf.data[i] = 0x00u; // Pressure sensors unpressed
+    }
+
     buf.modeTable[0] = 7u; // DualShock mode ID
     buf.modeTable[1] = 4u; // Digital mode ID
-    buf.frameCounter = counterVal;
-    buf.data[0] = 0x00u;
-    buf.data[1] = 0x79u; // DualShock 2 ID
-    buf.data[2] = 0xFFu; // Buttons unpressed
-    buf.data[3] = 0xFFu;
-    buf.data[4] = 0x7Fu; // Analogs centered
-    buf.data[5] = 0x7Fu;
-    buf.data[6] = 0x7Fu;
-    buf.data[7] = 0x7Fu;
-    buf.modeConfig = 2u;   // 2 supported modes
+    buf.frame = frameVal;
+    buf.findPadRetries = 0u;
+    buf.length = 32u;
+    buf.modeConfig = 2u;   // Config complete, 2 supported modes
     buf.modeCurId = 0x79u; // DualShock 2 type
+    buf.model = 2u;
+    buf.buttonDataReady = 1u;
+    buf.nrOfModes = 2u;
+    buf.modeCurOffs = 0u;
+    buf.nrOfActuators = 2u;
     buf.mode = 7u;         // DualShock mode
     buf.lock = 3u;         // Locked in analog mode
     buf.state = state;
     buf.reqState = reqState;
     buf.currentTask = 1u;
-    buf.length = 32u;
+    buf.runTask = 0u;
 }
     namespace
     {
@@ -299,7 +311,7 @@ void populatePadBuffer(PadDataNew &buf, uint32_t frameVal, uint32_t counterVal, 
                     const PS2VfsMounts mounts{paths.hostRoot, paths.cdRoot, paths.mcRoot};
                     descriptor = runtime->vfs().open(path, flags, mounts, runtime->romDevice());
                 }
-                const uint32_t reply = static_cast<uint32_t>(descriptor);
+                const uint32_t reply = descriptor >= 0 ? (descriptor == 0 ? 1u : static_cast<uint32_t>(descriptor)) : 0u;
                 if (request.receive.size < sizeof(reply) ||
                     !writeRpcReceive(rdram, request, &reply, sizeof(reply)))
                     return {};
@@ -377,7 +389,7 @@ void populatePadBuffer(PadDataNew &buf, uint32_t frameVal, uint32_t counterVal, 
                               << " offset=" << offset << " whence=" << whence
                               << " result=" << operationResult << std::endl;
                 }
-                const uint32_t reply = static_cast<uint32_t>(operationResult);
+                const uint32_t reply = operationResult >= 0 ? (operationResult == 0 ? 1u : static_cast<uint32_t>(operationResult)) : 0u;
                 if (request.receive.size < sizeof(reply) ||
                     !writeRpcReceive(rdram, request, &reply, sizeof(reply)))
                     return {};
@@ -1016,8 +1028,8 @@ void populatePadBuffer(PadDataNew &buf, uint32_t frameVal, uint32_t counterVal, 
                         return {};
                     }
                     PadAreaNew &area = *reinterpret_cast<PadAreaNew *>(padData);
-                    populatePadBuffer(area.buffers[0], 1u, 1u, PAD_STATE_STABLE, PAD_RSTAT_COMPLETE);
-                    populatePadBuffer(area.buffers[1], 0u, 0u, PAD_STATE_STABLE, PAD_RSTAT_COMPLETE);
+                    populatePadBuffer(area.buffers[0], 1u, PAD_STATE_STABLE, PAD_RSTAT_COMPLETE);
+                    populatePadBuffer(area.buffers[1], 0u, PAD_STATE_STABLE, PAD_RSTAT_COMPLETE);
 
                     std::cout << "[Armageddon HLE PAD state] open_area=0x" << std::hex << padArea
                               << " buffer0_state=STABLE buffer1_state=STABLE"

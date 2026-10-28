@@ -1474,6 +1474,16 @@ void EeScheduler::queueDeferredInvocation(GuestInvocation invocation, uint64_t d
     scheduleEvent(deadlineCycle, hostDeadline, EeEvent{EeEventType::RpcCallback, id, 0});
 }
 
+void EeScheduler::queueDeferredAction(std::function<void()> action, uint64_t delayCycles)
+{
+    assertExecutor();
+    const uint64_t deadlineCycle = m_eeCycle + (delayCycles > 0u ? delayCycles : 1u);
+    const auto hostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(delayCycles);
+    const uint32_t id = ++m_nextDeferredActionId;
+    m_deferredActions.emplace(id, std::move(action));
+    scheduleEvent(deadlineCycle, hostDeadline, EeEvent{EeEventType::DeferredAction, id, 0});
+}
+
 void EeScheduler::queueInvocation(GuestInvocation invocation)
 {
     assertExecutor();
@@ -1534,12 +1544,9 @@ uint32_t EeScheduler::invocationStackTop()
 {
     assertExecutor();
     const GuestThread *owner = currentThread();
-    if (!owner)
-    {
-        throw std::logic_error("EE invocation stack requested without a current guest context");
-    }
+    const int32_t threadId = owner ? owner->id : 0;
     const size_t depth = owner ? owner->invocations.size() : 0u;
-    const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(owner->id)) << 32u) |
+    const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(threadId)) << 32u) |
                          static_cast<uint32_t>(depth);
     const auto existing = m_invocationStackTops.find(key);
     if (existing != m_invocationStackTops.end())
@@ -2619,6 +2626,20 @@ void EeScheduler::processEvent(const EeEvent &event)
             GuestInvocation inv = std::move(it->second);
             m_deferredInvocations.erase(it);
             queueInvocation(std::move(inv));
+        }
+        break;
+    }
+    case EeEventType::DeferredAction:
+    {
+        auto it = m_deferredActions.find(event.id);
+        if (it != m_deferredActions.end())
+        {
+            auto action = std::move(it->second);
+            m_deferredActions.erase(it);
+            if (action)
+            {
+                action();
+            }
         }
         break;
     }

@@ -751,7 +751,7 @@ void GS::processGIFPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBy
             if ((nloop * nreg) & 1)
                 offset += 8;
         }
-        else if (flg == GIF_FMT_IMAGE)
+        else if (flg == GIF_FMT_IMAGE || flg == 3u)
         {
             const uint32_t totalImageBytes = nloop * 16u;
             const uint32_t avail = (offset < sizeBytes) ? (sizeBytes - offset) : 0u;
