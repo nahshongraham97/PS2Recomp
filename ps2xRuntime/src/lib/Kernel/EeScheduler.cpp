@@ -703,13 +703,17 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     const GuestThread *running = currentThread();
     if (running != nullptr && armageddonHleIdleKeyboardPoll(traceContext))
     {
-        for (int priority = running->currentPriority + 1; priority < kPriorityCount; ++priority)
+        for (int priority = running->currentPriority; priority < kPriorityCount; ++priority)
         {
-            if (!m_readyQueues[static_cast<size_t>(priority)].empty())
+            const auto &queue = m_readyQueues[static_cast<size_t>(priority)];
+            const bool hasOther = (priority > running->currentPriority && !queue.empty()) ||
+                                  (priority == running->currentPriority && queue.size() > 0u);
+            if (hasOther)
             {
                 m_rescheduleRequested = true;
                 m_timeSliceExpired = true;
-                g_armageddonHleSkipPriorityOnce = running->currentPriority;
+                if (priority > running->currentPriority)
+                    g_armageddonHleSkipPriorityOnce = running->currentPriority;
                 if (g_armageddonHleFairnessTraceCount < 32u)
                 {
                     ++g_armageddonHleFairnessTraceCount;
@@ -719,7 +723,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
                               << " thread=" << running->id
                               << " pc=0x" << std::hex << (traceContext ? traceContext->pc : 0u)
                               << " priority=" << std::dec << running->currentPriority
-                              << " next_lower_priority=" << priority << std::endl;
+                              << " ready_priority=" << priority << std::endl;
                 }
                 traceRenderCheckpoint("Armageddon-HLE-keyboard-poll-fairness");
                 return true;
@@ -2457,7 +2461,9 @@ void EeScheduler::processDueDeadlines()
             const auto now = std::chrono::steady_clock::now();
             for (const ScheduledEvent &item : m_deadlines)
             {
-                if (item.deadlineCycle <= m_eeCycle &&
+                const bool cycleDue = item.deadlineCycle <= m_eeCycle;
+                const bool hostDue = item.hostDeadline <= now;
+                if ((cycleDue || hostDue) &&
                     (pacingDeadline == std::chrono::steady_clock::time_point{} ||
                      item.hostDeadline < pacingDeadline))
                 {
@@ -2486,8 +2492,8 @@ void EeScheduler::processDueDeadlines()
             const auto pacedNow = std::chrono::steady_clock::now();
             auto firstFuture = std::partition(m_deadlines.begin(), m_deadlines.end(),
                                               [this, pacedNow](const ScheduledEvent &item)
-                                              { return item.deadlineCycle <= m_eeCycle &&
-                                                       item.hostDeadline <= pacedNow; });
+                                              { return (item.deadlineCycle <= m_eeCycle) ||
+                                                       (item.hostDeadline <= pacedNow); });
             due.insert(due.end(),
                        std::make_move_iterator(m_deadlines.begin()),
                        std::make_move_iterator(firstFuture));
@@ -2518,6 +2524,10 @@ void EeScheduler::processDueDeadlines()
 
         for (ScheduledEvent &scheduled : due)
         {
+            if (scheduled.deadlineCycle > m_eeCycle)
+            {
+                m_eeCycle = scheduled.deadlineCycle;
+            }
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
