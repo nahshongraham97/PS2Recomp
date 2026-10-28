@@ -863,6 +863,7 @@ namespace armageddon_hle
                 return {};
             }
             std::array<uint8_t, 0x1D0u> reply{};
+            reply[0] = 1u; // Endpoint state matching RPC 1 to prevent renegotiation loop
             if (!writeRpcReceive(rdram, request, reply.data(), reply.size()))
                 return {};
             static std::atomic<uint64_t> eventPollCount{0u};

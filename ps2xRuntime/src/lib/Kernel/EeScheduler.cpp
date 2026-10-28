@@ -57,10 +57,15 @@ namespace
     std::unordered_map<uint64_t, uint64_t> g_irqDispatchCounts;
     uint64_t g_irqTraceRecords = 0u;
 
-    bool armageddonHleIdleKeyboardPoll(const R5900Context *context)
+    bool armageddonHleIdleKeyboardPoll(const GuestThread *running, const R5900Context *context)
     {
-        if (std::getenv("PS2X_ARMAGEDDON_HLE_BOOT") == nullptr ||
-            std::getenv("PS2X_ARMAGEDDON_HLE_FAIR_POLL") == nullptr || context == nullptr)
+        static const bool s_fairPollEnabled = (std::getenv("PS2X_ARMAGEDDON_HLE_BOOT") != nullptr &&
+                                               std::getenv("PS2X_ARMAGEDDON_HLE_FAIR_POLL") != nullptr);
+        if (!s_fairPollEnabled)
+            return false;
+        if (running != nullptr && (running->entry == 0x00523128u || running->id == 6))
+            return true;
+        if (context == nullptr)
             return false;
         const uint32_t pc = context->pc;
         const uint32_t ra = getRegU32(context, 31);
@@ -431,6 +436,7 @@ void EeScheduler::run()
 
         if (checkpointDue(kGuestDispatchCycles))
         {
+            applyPendingPreemption();
             continue;
         }
 
@@ -701,7 +707,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     }
 
     const GuestThread *running = currentThread();
-    if (running != nullptr && armageddonHleIdleKeyboardPoll(traceContext))
+    if (running != nullptr && armageddonHleIdleKeyboardPoll(running, traceContext))
     {
         for (int priority = running->currentPriority; priority < kPriorityCount; ++priority)
         {
