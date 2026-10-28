@@ -2440,6 +2440,31 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                   << " thread=" << (owner ? owner->id : 0) << std::endl;
     }
 
+    if (sourcePc == 0x001AD628u)
+    {
+        static uint32_t armageddonWaitBranchCount = 0u;
+        if (armageddonWaitBranchCount < 32u)
+        {
+            ++armageddonWaitBranchCount;
+            std::cerr << "[Armageddon HLE wait loop callback dispatch] n=" << armageddonWaitBranchCount
+                      << " target=0x" << std::hex << targetPc
+                      << " non_null=" << (targetPc != 0u ? "true" : "false")
+                      << " registered=" << (hasFunction(targetPc) ? "true" : "false")
+                      << " cop0_status=0x" << ctx->cop0_status
+                      << " pending_irq=" << (m_eeScheduler && m_eeScheduler->hasPendingInterrupt() ? "true" : "false")
+                      << std::dec << std::endl;
+        }
+    }
+
+    if (m_eeScheduler && m_eeScheduler->hasPendingInterrupt())
+    {
+        const bool irqEnabled = ((ctx->cop0_status & 0x10001u) == 0x10001u) && ((ctx->cop0_status & 0x6u) == 0u);
+        if (irqEnabled)
+        {
+            m_eeScheduler->dispatchPendingInterrupts(rdram, ctx);
+        }
+    }
+
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
     // this charge bounds straight-line call chains that have no local loop.

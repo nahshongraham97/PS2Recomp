@@ -1561,6 +1561,13 @@ int EeScheduler::addIrqHandler(bool dmac,
                                   sp,
                                   true,
                                   append ? ++tail : --head});
+    std::cerr << "[EE_IRQ_REGISTER] type=" << (dmac ? "DMAC" : "INTC")
+              << " cause=" << cause
+              << " id=" << id
+              << " handler=0x" << std::hex << handler
+              << " arg=0x" << argument
+              << " gp=0x" << gp
+              << " sp=0x" << sp << std::dec << std::endl;
     return id;
 }
 
@@ -1832,6 +1839,121 @@ void EeScheduler::setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress)
             const uint64_t zero = 0u;
             std::memcpy(m_rdram + physical, &zero, sizeof(zero));
         }
+    }
+}
+
+bool EeScheduler::hasPendingInterrupt() const noexcept
+{
+    for (const auto &inv : m_pendingInvocations)
+    {
+        if (inv.kind == GuestInvocationKind::Interrupt)
+            return true;
+    }
+    return false;
+}
+
+size_t EeScheduler::registeredHandlerCount(bool dmac, uint32_t cause) const noexcept
+{
+    const auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
+    size_t count = 0;
+    for (const auto &[id, handler] : handlers)
+    {
+        if (handler.cause == cause)
+            ++count;
+    }
+    return count;
+}
+
+void EeScheduler::dispatchPendingInterrupts(uint8_t *rdram, R5900Context *callerContext)
+{
+    assertExecutor();
+    if (m_insideInterrupt)
+    {
+        return;
+    }
+
+    while (!m_pendingInvocations.empty())
+    {
+        auto it = std::find_if(m_pendingInvocations.begin(), m_pendingInvocations.end(),
+                               [](const GuestInvocation &inv) {
+                                   return inv.kind == GuestInvocationKind::Interrupt;
+                               });
+        if (it == m_pendingInvocations.end())
+            break;
+
+        GuestInvocation invocation = std::move(*it);
+        m_pendingInvocations.erase(it);
+
+        const bool wasInside = m_insideInterrupt;
+        m_insideInterrupt = true;
+        uint8_t *effectiveRdram = rdram != nullptr ? rdram : m_rdram;
+
+        static uint32_t armageddonDmacHandlerTraceCount = 0u;
+        const bool traceArmageddonDmacHandler =
+            invocation.context.pc == 0x001ACA60u && std::getenv("PS2X_ARMAGEDDON_DMA_HANDLER_TRACE") != nullptr &&
+            armageddonDmacHandlerTraceCount < 64u;
+        auto logArmageddonDmacHandler = [&](const char *phase)
+        {
+            if (!traceArmageddonDmacHandler || effectiveRdram == nullptr)
+                return;
+            uint32_t queueRead = 0u, queueWrite = 0u, status = 0u, secondaryStatus = 0u;
+            std::memcpy(&queueRead, effectiveRdram + 0x0064E544u, sizeof(queueRead));
+            std::memcpy(&queueWrite, effectiveRdram + 0x0064E540u, sizeof(queueWrite));
+            std::memcpy(&status, effectiveRdram + 0x0064E554u, sizeof(status));
+            std::memcpy(&secondaryStatus, effectiveRdram + 0x0064E550u, sizeof(secondaryStatus));
+            std::cerr << "[Armageddon guest DMAC handler (preempt)] phase=" << phase
+                      << " count=" << armageddonDmacHandlerTraceCount + 1u
+                      << " cause=0x" << std::hex << getRegU32(&invocation.context, 4)
+                      << " queue_read=0x" << queueRead << " queue_write=0x" << queueWrite
+                      << " status=0x" << status << " secondary_status=0x" << secondaryStatus
+                      << " d_stat=0x" << m_runtime.memory().readIORegister(0x1000E010u)
+                      << " pc=0x" << invocation.context.pc << " ra=0x" << getRegU32(&invocation.context, 31)
+                      << std::dec << std::endl;
+        };
+
+        if (traceArmageddonDmacHandler)
+        {
+            ++armageddonDmacHandlerTraceCount;
+            logArmageddonDmacHandler("entry");
+        }
+
+        PS2Runtime::RecompiledFunction fn = m_runtime.lookupFunction(invocation.context.pc);
+        if (fn)
+        {
+            fn(effectiveRdram, &invocation.context, &m_runtime);
+        }
+        else
+        {
+            m_runtime.reportMissingFunction(effectiveRdram,
+                                            &invocation.context,
+                                            invocation.context.pc,
+                                            invocation.context.pc,
+                                            PS2Runtime::GuestBranchKind::DirectJump,
+                                            "EE interrupt dispatch");
+        }
+
+        if (traceArmageddonDmacHandler)
+        {
+            logArmageddonDmacHandler("return");
+        }
+
+        m_insideInterrupt = wasInside;
+
+        if (invocation.onComplete && callerContext != nullptr)
+        {
+            try
+            {
+                invocation.onComplete(invocation.context, *callerContext);
+            }
+            catch (const EeDispatcherTransfer &)
+            {
+            }
+        }
+    }
+
+    if (m_pendingInvocations.empty() && m_eeCycle < m_nextDeadlineCycle.load(std::memory_order_relaxed))
+    {
+        m_checkpointPending.store(false, std::memory_order_release);
     }
 }
 

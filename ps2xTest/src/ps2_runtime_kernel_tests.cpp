@@ -327,6 +327,60 @@ namespace
         ctx->pc = 0u;
     }
 
+    constexpr uint32_t K_DMAC_SPIN_MAIN = 0x00055000u;
+    constexpr uint32_t K_DMAC_SPIN_HANDLER = 0x00055100u;
+    constexpr uint32_t K_DMAC_SPIN_POLL_FN = 0x00055200u;
+    constexpr uint32_t K_DMAC_SPIN_COUNTER_ADDR = 0x00055300u;
+    static uint32_t gSpinPollCalls = 0u;
+    static uint32_t gSpinHandlerCalls = 0u;
+
+    void schedulerDmacSpinHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        ++gSpinHandlerCalls;
+        uint32_t counter = 0;
+        std::memcpy(&counter, rdram + K_DMAC_SPIN_COUNTER_ADDR, sizeof(counter));
+        if (counter > 0)
+        {
+            --counter;
+            std::memcpy(rdram + K_DMAC_SPIN_COUNTER_ADDR, &counter, sizeof(counter));
+        }
+        ctx->pc = 0u;
+    }
+
+    void schedulerDmacSpinPollFn(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        ++gSpinPollCalls;
+        ctx->pc = getRegU32(ctx, 31);
+    }
+
+    void schedulerDmacSpinMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ctx->cop0_status = 0x10001u;
+        const uint32_t initialCounter = 1u;
+        std::memcpy(rdram + K_DMAC_SPIN_COUNTER_ADDR, &initialCounter, sizeof(initialCounter));
+
+        runtime->eeScheduler().addIrqHandler(true, 2u, K_DMAC_SPIN_HANDLER, false, 0u, 0u, 0u);
+        runtime->eeScheduler().setIrqCauseEnabled(true, 2u, true);
+        runtime->eeScheduler().dispatchIrq(true, 2u);
+
+        uint32_t spins = 0;
+        while (spins < 100u)
+        {
+            ++spins;
+            uint32_t counter = 0;
+            std::memcpy(&counter, rdram + K_DMAC_SPIN_COUNTER_ADDR, sizeof(counter));
+            if (counter == 0)
+                break;
+            setRegU32(*ctx, 31, K_DMAC_SPIN_MAIN + 0x10u);
+            runtime->dispatchGuestBranch(rdram, ctx, K_DMAC_SPIN_POLL_FN, K_DMAC_SPIN_MAIN, K_DMAC_SPIN_MAIN + 0x10u,
+                                         PS2Runtime::GuestBranchKind::IndirectCall, "JALR");
+        }
+
+        setRegU32(*ctx, 2, KE_OK);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
     constexpr uint32_t K_SCHED_MAIN = 0x300000u;
     constexpr uint32_t K_SCHED_A = 0x300100u;
     constexpr uint32_t K_SCHED_A_RESUME = 0x300104u;
@@ -1745,6 +1799,31 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(static_cast<uint32_t>(getRegS32(env.ctx, 2)),
                      kExpectedHandler,
                      "GetEntryAddress should read and return the handler address from the table");
+        });
+
+        tc.Run("spin loop waits on counter cleared by queued DMAC handler", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(K_DMAC_SPIN_MAIN, schedulerDmacSpinMain);
+            env.runtime.registerFunction(K_DMAC_SPIN_HANDLER, schedulerDmacSpinHandler);
+            env.runtime.registerFunction(K_DMAC_SPIN_POLL_FN, schedulerDmacSpinPollFn);
+
+            gSpinPollCalls = 0u;
+            gSpinHandlerCalls = 0u;
+
+            R5900Context mainContext{};
+            mainContext.pc = K_DMAC_SPIN_MAIN;
+            setRegU32(mainContext, 29, 0x00100000u);
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            uint32_t finalCounter = 999u;
+            std::memcpy(&finalCounter, env.rdram.data() + K_DMAC_SPIN_COUNTER_ADDR, sizeof(finalCounter));
+
+            t.Equals(gSpinHandlerCalls, 1u, "queued DMAC handler should be dispatched while polling");
+            t.IsTrue(gSpinPollCalls >= 1u, "poll function should be called at least once");
+            t.Equals(finalCounter, 0u, "counter should be cleared to 0 by the DMAC handler");
+            t.Equals(getRegS32(mainContext, 2), KE_OK, "main loop should exit successfully with KE_OK");
         });
     });
 }

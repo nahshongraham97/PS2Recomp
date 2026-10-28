@@ -990,13 +990,48 @@ namespace armageddon_hle
                                   << " bytes=0x100" << std::dec << std::endl;
                         return {};
                     }
-                    padData[0x70u] = 0x02u; // PAD_STATE_FINDCTP1
+                    std::memset(padData, 0, 0x100u);
+                    // Buffer 0 (offset 0x00)
+                    *reinterpret_cast<uint16_t *>(padData + 0x50u) = 7u; // DualShock mode ID
+                    *reinterpret_cast<uint16_t *>(padData + 0x52u) = 4u; // Digital mode ID
+                    *reinterpret_cast<uint32_t *>(padData + 0x58u) = 1u;
+                    padData[0x5Cu + 0] = 0x00u;
+                    padData[0x5Cu + 1] = 0x79u; // DualShock 2 ID
+                    padData[0x5Cu + 2] = 0xFFu; // Buttons unpressed
+                    padData[0x5Cu + 3] = 0xFFu;
+                    padData[0x5Cu + 4] = 0x7Fu; // Analogs centered
+                    padData[0x5Cu + 5] = 0x7Fu;
+                    padData[0x5Cu + 6] = 0x7Fu;
+                    padData[0x5Cu + 7] = 0x7Fu;
+                    padData[0x64u] = 2u; // 2 supported modes
+                    padData[0x65u] = 0x79u; // DualShock 2 type
+                    padData[0x70u] = 0x06u; // PAD_STATE_STABLE
                     padData[0x71u] = 0x00u; // PAD_RSTAT_COMPLETE
-                    padData[0xF0u] = 0x02u;
-                    padData[0xF1u] = 0x00u;
+                    padData[0x72u] = 0x01u; // ok
+                    padData[0x73u] = 0x20u; // len = 32
+
+                    // Buffer 1 (offset 0x80)
+                    *reinterpret_cast<uint16_t *>(padData + 0xD0u) = 7u;
+                    *reinterpret_cast<uint16_t *>(padData + 0xD2u) = 4u;
+                    *reinterpret_cast<uint32_t *>(padData + 0xD8u) = 0u;
+                    padData[0xDCu + 0] = 0x00u;
+                    padData[0xDCu + 1] = 0x79u;
+                    padData[0xDCu + 2] = 0xFFu;
+                    padData[0xDCu + 3] = 0xFFu;
+                    padData[0xDCu + 4] = 0x7Fu;
+                    padData[0xDCu + 5] = 0x7Fu;
+                    padData[0xDCu + 6] = 0x7Fu;
+                    padData[0xDCu + 7] = 0x7Fu;
+                    padData[0xE4u] = 2u;
+                    padData[0xE5u] = 0x79u;
+                    padData[0xF0u] = 0x06u; // PAD_STATE_STABLE
+                    padData[0xF1u] = 0x00u; // PAD_RSTAT_COMPLETE
+                    padData[0xF2u] = 0x01u; // ok
+                    padData[0xF3u] = 0x20u; // len = 32
+
                     std::cout << "[Armageddon HLE PAD state] open_area=0x" << std::hex << padArea
-                              << " buffer0_state=FINDCTP1 buffer1_state=FINDCTP1"
-                              << " request_state=COMPLETE" << std::dec << std::endl;
+                              << " buffer0_state=STABLE buffer1_state=STABLE"
+                              << " request_state=COMPLETE frame0=1 frame1=0 len=32" << std::dec << std::endl;
                 }
                 break;
             case 0x10u: // PAD_RPCCMD_INIT

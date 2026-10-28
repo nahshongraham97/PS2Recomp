@@ -470,6 +470,17 @@ namespace
             readGuestWord(rdram, gp - 0x5b9cu), readGuestWord(rdram, gp - 0x5b7cu)};
         ++gAllocatorPollCalls;
         const bool changed = !gHaveLastAllocatorPollState || before != gLastAllocatorPollState || after != before;
+        if (gAllocatorPollCalls == 0u || changed)
+        {
+            if (runtime)
+            {
+                std::cout << "[Armageddon HLE IRQ census at allocator-poll]"
+                          << " dmac1_handlers=" << runtime->eeScheduler().registeredHandlerCount(true, 1u)
+                          << " dmac2_handlers=" << runtime->eeScheduler().registeredHandlerCount(true, 2u)
+                          << " intc2_handlers=" << runtime->eeScheduler().registeredHandlerCount(false, 2u)
+                          << std::endl;
+            }
+        }
         if (gAllocatorPollCalls <= 16u || changed)
         {
             std::cout << "[Armageddon HLE allocator callback] call=" << gAllocatorPollCalls
@@ -1375,6 +1386,7 @@ int main(int argc, char **argv)
         installNestedFunctionProbe(runtime, 0x001B33C0u, "FUN_001B33C0_gate_writer") &&
         installNestedFunctionProbe(runtime, 0x001B5D20u, "FUN_001B5D20_gate_writer") &&
         installNestedFunctionProbe(runtime, 0x001CFE70u, "FUN_001CFE70_gate_writer") &&
+        installNestedFunctionProbe(runtime, 0x001AEA70u, "FUN_001AEA70_display_irq_init") &&
         installNestedFunctionProbe(runtime, 0x001AD520u, "FUN_001AD520_wait_path");
     std::cout << "[Armageddon HLE heap probe] installed="
               << (heapProbeInstalled ? "true" : "false")
