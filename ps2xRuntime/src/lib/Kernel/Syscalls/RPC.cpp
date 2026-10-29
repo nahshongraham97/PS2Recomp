@@ -567,15 +567,13 @@ namespace ps2_syscalls
 
             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
 
-            if (iopResult.signalNowaitCompletion &&
-                (mode & kSifRpcModeNowait) != 0u)
-            {
+            // Both flags can describe the same completed NOWAIT request.
+            // A binary guest semaphore gets one token per RPC completion.
+            const bool shouldSignalCompletion =
+                iopResult.signalCompletion ||
+                (iopResult.signalNowaitCompletion && (mode & kSifRpcModeNowait) != 0u);
+            if (shouldSignalCompletion)
                 (void)signalRpcCompletionSema(runtime, completionSemaphore);
-            }
-            if (iopResult.signalCompletion)
-            {
-                (void)signalRpcCompletionSema(runtime, completionSemaphore);
-            }
         }
 
         uint32_t guestFunction = iopResult.guestFunction;
@@ -710,6 +708,16 @@ namespace ps2_syscalls
             }
             if (!runtime->hasFunction(callbackFunction))
             {
+                if (sid == 0x61766973u)
+                {
+                    std::cerr << "[SifCallRpc] LGKBM end function is not registered"
+                              << " sid=0x61766973 rpc=0x" << std::hex << rpcNum
+                              << " end_function=0x" << endFunction
+                              << " action=fail-stop" << std::dec << std::endl;
+                    runtime->requestStop();
+                    completeClient(parent, false);
+                    return;
+                }
                 (void)signalRpcCompletionSema(runtime, completionSemaphore);
                 completeClient(parent, false);
                 return;
@@ -726,6 +734,14 @@ namespace ps2_syscalls
             {
                 completeClient(base, true);
             };
+            if (sid == 0x61766973u && (mode & kSifRpcModeNowait) != 0u)
+            {
+                // Let sceSifCallRpc return so its caller can enter WaitSema.
+                // The completion event then runs the guest end function, which
+                // owns iSignalSema for this service.
+                runtime->eeScheduler().queueDeferredInvocation(std::move(callback), 1u);
+                return;
+            }
             runtime->eeScheduler().invokeCurrent(std::move(callback));
         };
 

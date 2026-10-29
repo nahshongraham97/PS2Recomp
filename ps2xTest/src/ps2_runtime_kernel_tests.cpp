@@ -8,6 +8,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -1919,6 +1920,56 @@ void register_ps2_runtime_kernel_tests()
             t.IsFalse(actionExecuted, "Deferred action should not execute immediately");
         });
 
+        tc.Run("Armageddon LGKBM async poll delegates completion to guest end function", [](TestCase &t)
+        {
+#ifdef _WIN32
+            _putenv("PS2X_ARMAGEDDON_HLE_BOOT=1");
+#else
+            setenv("PS2X_ARMAGEDDON_HLE_BOOT", "1", 1);
+#endif
+            PS2Runtime::IoPaths paths{};
+            paths.elfPath = "SLUS_214.10";
+            PS2Runtime::setIoPaths(paths);
+
+            TestEnv env;
+            constexpr uint32_t kRequestAddr = 0x00100000u;
+            constexpr uint32_t kReplyAddr = 0x00200000u;
+            std::memset(env.rdram.data() + kRequestAddr, 0, 0x1D0u);
+
+            ps2x::iop::RpcRequest req{};
+            req.sid = 0x61766973u;
+            req.function = 2u;
+            req.mode = 1u;
+            req.send = {kRequestAddr, 0x1D0u};
+            req.receive = {kReplyAddr, 0x1D0u};
+            req.endFunction = 0x00523818u;
+            req.endParameter = 0x00590DB8u;
+
+            const ps2x::iop::RpcResult result =
+                armageddon_hle::handleRpc(&env.runtime, env.rdram.data(), req);
+            t.IsTrue(result.handled, "LGKBM event polls should produce the documented empty-queue reply");
+            t.Equals(result.resultAddress, kReplyAddr, "RPC result must point at the guest receive buffer");
+            t.IsFalse(result.signalCompletion, "host transport must not signal after the guest callback");
+            t.IsFalse(result.signalNowaitCompletion, "NOWAIT completion belongs to the guest end function");
+            t.Equals(result.callbackPolicy, ps2x::iop::CallbackPolicy::RuntimeDefault,
+                     "the runtime must dispatch the client end function");
+            t.Equals(result.serverDispatchPolicy, ps2x::iop::ServerDispatchPolicy::Suppress,
+                     "the host service must not dispatch a second server implementation");
+
+            const uint8_t *reply = env.rdram.data() + kReplyAddr;
+            uint16_t eventCount = 0xFFFFu;
+            std::memcpy(&eventCount, reply + 2u, sizeof(eventCount));
+            t.Equals(reply[0], uint8_t{1u}, "endpoint state remains active");
+            t.Equals(eventCount, uint16_t{0u}, "empty event queue has zero events");
+
+#ifdef _WIN32
+            _putenv("PS2X_ARMAGEDDON_HLE_BOOT=");
+#else
+            unsetenv("PS2X_ARMAGEDDON_HLE_BOOT");
+#endif
+            PS2Runtime::setIoPaths({});
+        });
+
         tc.Run("GS per-path persistent IMAGE parser transfers verified bytes and isolates paths", [](TestCase &t)
         {
             class MockGsBackend final : public GSRasterBackend
@@ -2016,6 +2067,62 @@ void register_ps2_runtime_kernel_tests()
             gs.processGIFPacket(GifPathId::Path2, packetFlg3.data(), static_cast<uint32_t>(packetFlg3.size()));
             t.Equals(rawMock->uploadedBytes.size(), 16ULL, "FLG=3 must transfer 16 image bytes");
             t.Equals(static_cast<uint32_t>(rawMock->uploadedBytes[0]), 0xCCu, "FLG=3 payload byte must be 0xCC");
+        });
+
+        tc.Run("VIF1 TTE MARK and DIRECT codes do not become pending PATH2 IMAGE pixels", [](TestCase &t)
+        {
+            TestEnv env;
+            PS2Memory &memory = env.runtime.memory();
+            std::vector<std::vector<uint8_t>> packets;
+            memory.setGifPacketCallback([&packets](const uint8_t *data, uint32_t sizeBytes)
+            {
+                packets.emplace_back(data, data + sizeBytes);
+            });
+
+            constexpr uint32_t kVifDirectOneQw = (0x50u << 24u) | 1u;
+            constexpr uint32_t kVifMark = (0x07u << 24u) | 0x1234u;
+            constexpr uint64_t kImageTag = 2ull | (2ull << 58u); // Two IMAGE quadwords owed.
+
+            std::array<uint8_t, 20> firstDirect{};
+            std::memcpy(firstDirect.data(), &kVifDirectOneQw, sizeof(kVifDirectOneQw));
+            std::memcpy(firstDirect.data() + 4u, &kImageTag, sizeof(kImageTag));
+            memory.processVIF1Data(firstDirect.data(), static_cast<uint32_t>(firstDirect.size()));
+
+            std::array<uint8_t, 24> tteMarkThenDirect{};
+            std::memcpy(tteMarkThenDirect.data(), &kVifMark, sizeof(kVifMark));
+            std::memcpy(tteMarkThenDirect.data() + 4u, &kVifDirectOneQw, sizeof(kVifDirectOneQw));
+            std::fill(tteMarkThenDirect.begin() + 8, tteMarkThenDirect.end(), 0xA5u);
+            memory.processVIF1Data(tteMarkThenDirect.data(), static_cast<uint32_t>(tteMarkThenDirect.size()));
+
+            std::array<uint8_t, 20> finalDirect{};
+            std::memcpy(finalDirect.data(), &kVifDirectOneQw, sizeof(kVifDirectOneQw));
+            std::fill(finalDirect.begin() + 4, finalDirect.end(), 0x5Au);
+            memory.processVIF1Data(finalDirect.data(), static_cast<uint32_t>(finalDirect.size()));
+
+            t.Equals(packets.size(), 3u, "Initial DIRECT and both IMAGE continuation DIRECTs must reach PATH2");
+            if (packets.size() == 3u)
+            {
+                t.Equals(packets[0].size(), 16u, "Initial DIRECT must submit the original GIF IMAGE tag only");
+                t.Equals(packets[1].size(), 32u, "TTE MARK; DIRECT must synthesize one IMAGE tag plus one payload QW");
+                t.Equals(packets[2].size(), 32u, "Final DIRECT must synthesize one IMAGE tag plus one payload QW");
+                t.IsTrue(std::all_of(packets[1].begin() + 16, packets[1].end(), [](uint8_t byte) { return byte == 0xA5u; }),
+                         "TTE MARK and DIRECT VIFcodes must not be forwarded as IMAGE pixels");
+                t.IsTrue(std::all_of(packets[2].begin() + 16, packets[2].end(), [](uint8_t byte) { return byte == 0x5Au; }),
+                         "The second owed IMAGE QW must be preserved across another DIRECT boundary");
+
+                uint64_t firstContinuationTag = 0u;
+                uint64_t finalContinuationTag = 0u;
+                std::memcpy(&firstContinuationTag, packets[1].data(), sizeof(firstContinuationTag));
+                std::memcpy(&finalContinuationTag, packets[2].data(), sizeof(finalContinuationTag));
+                t.Equals(static_cast<uint32_t>(firstContinuationTag & 0x7FFFu), 1u,
+                         "First continuation tag must declare one image QW");
+                t.Equals(static_cast<uint32_t>((firstContinuationTag >> 15u) & 1u), 0u,
+                         "First continuation must leave the GIF image transfer open");
+                t.Equals(static_cast<uint32_t>((finalContinuationTag >> 15u) & 1u), 1u,
+                         "Final continuation must close the GIF image transfer");
+                t.Equals(static_cast<uint32_t>((firstContinuationTag >> 58u) & 3u), 2u,
+                         "Continuation tag must use GIF IMAGE format");
+            }
         });
 
         tc.Run("ChangeThreadPriority returns previous priority", [](TestCase &t)

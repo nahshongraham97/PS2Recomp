@@ -49,6 +49,7 @@ namespace ps2x::iop::detail
         [[nodiscard]] IopScheduledCallState scheduledCallState(uint32_t callId) const;
         [[nodiscard]] bool releaseScheduledCall(uint32_t callId);
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);
+        [[nodiscard]] bool runPostBootCallbacks();
         void runEeCycles(uint64_t eeCycles) noexcept;
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;

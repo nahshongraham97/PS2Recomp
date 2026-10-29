@@ -636,6 +636,8 @@ namespace ps2_stubs
             }
             (void)readGuestWord(rdram, clientAddress + 0x1Cu, endFunction);
             (void)readGuestWord(rdram, clientAddress + 0x20u, endParameter);
+            const bool lgkbmGuestEndSignalsSemaphore =
+                sid == 0x61766973u && endFunction == 0x00523818u;
             std::cout << "[Armageddon HLE RPC request] source_pc=0x" << std::hex << sourcePc
                       << " source_ra=0x" << sourceRa << " sid=0x" << sid
                       << " rpc=0x" << rpcNumber << " mode=0x" << mode
@@ -653,7 +655,8 @@ namespace ps2_stubs
                                 requestBytes, packetSize, sid, rpcNumber, sourcePc, sourceRa,
                                 serverAddress, server, semaWord, endFunction, endParameter,
                                 sendAddress, sendSize, receiveAddress, receiveSize,
-                                packetSourceAddress, callerCtx]() mutable
+                                packetSourceAddress, callerCtx,
+                                lgkbmGuestEndSignalsSemaphore]() mutable
             {
                 const ps2x::iop::RpcResult result = armageddon_hle::handleRpc(runtime, rdram, rpcRequest);
                 if (!result.handled)
@@ -723,12 +726,13 @@ namespace ps2_stubs
                         SET_GPR_U32(&callback.context, 29, runtime->eeScheduler().invocationStackTop());
                         SET_GPR_U32(&callback.context, 31, 0u);
                         callback.onComplete = [runtime, rdram, clientAddress, packetAddress,
-                                               recordId, semaWord, sid, rpcNumber](const R5900Context &, R5900Context &)
+                                               recordId, semaWord, sid, rpcNumber,
+                                               lgkbmGuestEndSignalsSemaphore](const R5900Context &, R5900Context &)
                         {
                             const bool clientCleared = writeGuestWord(rdram, clientAddress, 0u);
                             const bool packetReleased = writeGuestWord(rdram, packetAddress + 16u, recordId & ~1u);
                             bool semaphoreSignaled = false;
-                            if (static_cast<int32_t>(semaWord) >= 0)
+                            if (static_cast<int32_t>(semaWord) >= 0 && !lgkbmGuestEndSignalsSemaphore)
                             {
                                 semaphoreSignaled = runtime->eeScheduler().signalSemaphore(
                                     static_cast<int32_t>(semaWord), true) >= 0;
@@ -737,7 +741,9 @@ namespace ps2_stubs
                                       << " rpc=0x" << rpcNumber << " client=0x" << clientAddress
                                       << " client_cleared=" << (clientCleared ? "true" : "false")
                                       << " packet_released=" << (packetReleased ? "true" : "false")
-                                      << " semaphore_signaled=" << (semaphoreSignaled ? "true" : "false")
+                                      << " host_semaphore_signaled=" << (semaphoreSignaled ? "true" : "false")
+                                      << " completion_owner="
+                                      << (lgkbmGuestEndSignalsSemaphore ? "guest-end-function" : "host")
                                       << std::dec << std::endl;
                         };
                         try
@@ -785,12 +791,12 @@ namespace ps2_stubs
             const bool isLgkbmPoll = (sid == 0x61766973u && rpcNumber == 2u);
             if ((mode & 1u) != 0u || isLgkbmPoll)
             {
-                // Method 2 polls the lgkbm event queue repeatedly. When scheduled
-                // without delay, high-priority Thread 6 starves main game Thread 1.
-                // Throttle poll completion with ~2ms (600,000 cycles) delay so Thread 1 runs.
+                // Schedule the empty LGKBM reply at the next EE event boundary,
+                // allowing the caller to return and block before end_func runs.
+                // The guest end function performs iSignalSema; no time-based
+                // polling throttle is needed for this service.
                 constexpr uint64_t kDefaultRpcDeferCycles = 4960000ull;
-                constexpr uint64_t kLgkbmPollDeferCycles = 600000ull;
-                const uint64_t deferCycles = isLgkbmPoll ? kLgkbmPollDeferCycles : kDefaultRpcDeferCycles;
+                const uint64_t deferCycles = isLgkbmPoll ? 1u : kDefaultRpcDeferCycles;
                 runtime->eeScheduler().queueDeferredAction(std::move(completeRpc), deferCycles);
                 return true;
             }

@@ -167,8 +167,22 @@ void populatePadBuffer(PadDataNew &buf, uint32_t frameVal, uint8_t state, uint8_
             result.handled = true;
             result.resultAddress = request.receive.address;
             result.signalCompletion = true;
-            result.signalNowaitCompletion = true;
             result.callbackPolicy = ps2x::iop::CallbackPolicy::Suppress;
+            result.serverDispatchPolicy = ps2x::iop::ServerDispatchPolicy::Suppress;
+            return result;
+        }
+
+        ps2x::iop::RpcResult finishLgkbmRpc(const ps2x::iop::RpcRequest &request)
+        {
+            if (request.endFunction == 0u)
+                return finishHostRpc(request);
+
+            // LGKBM's asynchronous completion is its guest end function. For
+            // Armageddon that callback calls iSignalSema; do not also signal
+            // the client semaphore from the host transport.
+            ps2x::iop::RpcResult result{};
+            result.handled = true;
+            result.resultAddress = request.receive.address;
             result.serverDispatchPolicy = ps2x::iop::ServerDispatchPolicy::Suppress;
             return result;
         }
@@ -842,7 +856,7 @@ void populatePadBuffer(PadDataNew &buf, uint32_t frameVal, uint8_t state, uint8_
                       << " guest_compare=reply[0x04]==reply[0x0A]"
                       << " source=KillzoneRecomp-GPL-3.0-findings-protocol-only"
                       << " client=Armageddon-overlay-RPC-observed" << std::dec << std::endl;
-            return finishHostRpc(request);
+            return finishLgkbmRpc(request);
         }
 
         // The guest follows method 3 with method 1 to enumerate USB devices.
@@ -879,7 +893,7 @@ void populatePadBuffer(PadDataNew &buf, uint32_t frameVal, uint8_t state, uint8_
                       << " assumption=inert-virtual-keyboard-no-events"
                       << " source=KillzoneRecomp-GPL-3.0-findings-protocol-only"
                       << std::endl;
-            return finishHostRpc(request);
+            return finishLgkbmRpc(request);
         }
 
         // Method 2 polls the endpoint's event queue. The Armageddon guest
@@ -913,7 +927,7 @@ void populatePadBuffer(PadDataNew &buf, uint32_t frameVal, uint8_t state, uint8_
                           << " source=KillzoneRecomp-GPL-3.0-findings-protocol-only"
                           << std::endl;
             }
-            return finishHostRpc(request);
+            return finishLgkbmRpc(request);
         }
 
         // This profile deliberately models an absent card. Service init

@@ -249,6 +249,11 @@ namespace ps2x::iop
         return true;
     }
 
+    bool IopSubsystem::runPostBootCallbacks()
+    {
+        return m_impl->emulator.runPostBootCallbacks();
+    }
+
     void IopSubsystem::runEeCycles(uint64_t eeCycles) noexcept
     {
         m_impl->emulator.runEeCycles(eeCycles);

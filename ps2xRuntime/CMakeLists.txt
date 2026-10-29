@@ -343,7 +343,6 @@ elseif(WIN32)
         bcrypt
         secur32
         ws2_32
-        user32
         advapi32
         ole32
         shell32
@@ -698,9 +697,11 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
     endif()
 endif()
 
-# Work around WinAPI vs raylib symbol clash for CloseWindow on x64
+# Work around WinAPI vs raylib symbol clashes on Windows static linkers.
 if(MSVC)
     target_link_options(ps2EntryRunner PRIVATE "/FORCE:MULTIPLE")
+elseif(MINGW)
+    target_link_options(ps2EntryRunner PRIVATE "-Wl,--allow-multiple-definition")
 endif()
 
 # Vita: Work around for GCC 10's LTO plugin

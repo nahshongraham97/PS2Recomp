@@ -32,7 +32,6 @@ namespace ps2x::iop::detail
         case 15:
         case 16:
         case 17:
-        case 20:
         case 21:
             setV0(0u);
             return true;

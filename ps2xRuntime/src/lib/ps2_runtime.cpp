@@ -946,6 +946,36 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
         return;
     }
 
+    // LOADCORE runs post-boot notifications after the configured modules have
+    // started. Execute the EESYNC registration captured from guest module code
+    // here, before SIFCMD publishes CMDINIT; do not synthesize BOOTEND in the
+    // host runtime.
+    constexpr uint32_t kSmflag = 4u;
+    constexpr uint32_t kBootEnd = 0x00040000u;
+    uint32_t smflagBeforeBootEnd = 0u;
+    if (!m_iopSubsystem->readSifRegister(kSmflag, smflagBeforeBootEnd))
+    {
+        std::cerr << "[Armageddon host reboot] bootend_published=false"
+                  << " reason=SMFLAG_unavailable_before_postboot_callbacks" << std::endl;
+        return;
+    }
+    const bool postBootCallbacksRun = m_iopSubsystem->runPostBootCallbacks();
+    uint32_t smflagAfterBootEnd = 0u;
+    const bool bootEndReadBack = m_iopSubsystem->readSifRegister(kSmflag, smflagAfterBootEnd);
+    if (!postBootCallbacksRun || !bootEndReadBack || (smflagAfterBootEnd & kBootEnd) == 0u)
+    {
+        std::cerr << "[Armageddon host reboot] bootend_published=false"
+                  << " reason=EESYNC_postboot_callback_failed"
+                  << " callbacks_returned=" << postBootCallbacksRun
+                  << " readback=" << bootEndReadBack
+                  << " smflag=0x" << std::hex << smflagAfterBootEnd << std::dec << std::endl;
+        return;
+    }
+    std::cout << "[Armageddon host reboot] event=IOP_SMFLAG_BOOTEND"
+              << " publisher=guest_EESYNC_postboot_callback"
+              << " smflag_before=0x" << std::hex << smflagBeforeBootEnd
+              << " smflag_after=0x" << smflagAfterBootEnd << std::dec << std::endl;
+
     // Start the original DNAS SIFCMD sceSifInitRpc export after its IRX and
     // dependent modules have started. It publishes CMDINIT and then remains
     // pending for the EE's INIT_CMD; this reproduces the guest command path
@@ -1011,23 +1041,20 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
         return;
     }
 
-    constexpr uint32_t kSmflag = 4u;
-    constexpr uint32_t kBootEnd = 0x00040000u;
-    uint32_t smflagBefore = 0u;
-    if (!m_iopSubsystem->readSifRegister(kSmflag, smflagBefore) ||
-        !m_iopSubsystem->writeSifRegisterFromIop(kSmflag, kBootEnd))
-    {
-        std::cerr << "[Armageddon host reboot] bootend_published=false"
-                  << " reason=IOP_SMFLAG_unavailable" << std::endl;
-        return;
-    }
     uint32_t smflagAfter = 0u;
     const bool readBack = m_iopSubsystem->readSifRegister(kSmflag, smflagAfter);
+    if (!readBack || (smflagAfter & kBootEnd) == 0u)
+    {
+        std::cerr << "[Armageddon host reboot] bootend_published=false"
+                  << " reason=guest_EESYNC_flag_not_retained_after_CMDINIT"
+                  << " smflag=0x" << std::hex << smflagAfter << std::dec << std::endl;
+        return;
+    }
     std::cout << "[Armageddon host reboot] bootend_published=true"
-              << " publisher=host_shortcut"
-              << " guest_EESYNC_claim=false"
+              << " publisher=guest_EESYNC_postboot_callback"
+              << " guest_EESYNC_claim=true"
               << " original_sifcmd_cmdinit=true"
-              << " smflag_before=0x" << std::hex << smflagBefore
+              << " smflag_before=0x" << std::hex << smflagBeforeBootEnd
               << " smflag_after=0x" << smflagAfter << std::dec
               << " readback=" << readBack
               << " iop_initialization_verified=false" << std::endl;
@@ -2192,6 +2219,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 {
 #if defined(PS2X_ARMAGEDDON_RELOCATIONS)
     const uint32_t callerExecPc = armageddon_relocations::executionPc(ctx);
+#else
+    const uint32_t callerExecPc = sourcePc;
 #endif
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);

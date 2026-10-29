@@ -41,6 +41,9 @@ namespace ps2x::iop
         [[nodiscard]] IopScheduledCallState scheduledCallState(uint32_t callId) const;
         [[nodiscard]] bool releaseScheduledCall(uint32_t callId);
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result = nullptr);
+        // Run LOADCORE callbacks after the complete boot-module start phase.
+        // Unsupported callback-list shapes fail closed instead of being skipped.
+        [[nodiscard]] bool runPostBootCallbacks();
         void runEeCycles(uint64_t eeCycles) noexcept;
 
         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;

@@ -152,6 +152,28 @@ namespace ps2x::iop::detail
         case 8: // sceSifDmaStat
             setV0(0xFFFFFFFFu);
             return true;
+        case 21: // sceSifGetMSFlag
+        case 23: // sceSifGetSMFlag
+        {
+            uint32_t value = 0u;
+            const uint32_t index = ordinal == 21u ? 3u : 4u;
+            setV0(m_memory.readSifRegister(index, value) ? value : 0xFFFFFFFFu);
+            return true;
+        }
+        case 22: // sceSifSetMSFlag
+        case 24: // sceSifSetSMFlag
+        {
+            const uint32_t index = ordinal == 22u ? 3u : 4u;
+            uint32_t value = 0u;
+            if (!m_memory.writeSifRegisterFromIop(index, cpu.gpr[4]) ||
+                !m_memory.readSifRegister(index, value))
+            {
+                setV0(0xFFFFFFFFu);
+                return true;
+            }
+            setV0(value);
+            return true;
+        }
         case 29: // sceSifCheckInit
             setV0(m_sifInitialized ? 1u : 0u);
             return true;

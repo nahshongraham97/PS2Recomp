@@ -115,6 +115,16 @@ namespace ps2x::iop::detail
             uint32_t argument = 0u;
         };
 
+        struct PostBootCallback
+        {
+            uint32_t function = 0u;
+            uint32_t gp = 0u;
+            uint32_t priority = 0u;
+            int32_t ownerModuleId = 0;
+            uint32_t ownerBase = 0u;
+            uint32_t ownerSize = 0u;
+        };
+
         struct PendingDma
         {
             int irq = kNoDmaInterrupt;
@@ -168,6 +178,8 @@ namespace ps2x::iop::detail
             ioman.reset();
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
+            postBootCallbacks.clear();
+            postBootCallbacksDispatched = false;
             scheduledExportCalls.clear();
             nextScheduledCallId = 1u;
             nextModuleId = 1;
@@ -463,6 +475,52 @@ namespace ps2x::iop::detail
                 return ImportDisposition::Handled;
             }
 
+            if (iequals(call.library, "loadcore") && call.ordinal == 20u)
+            {
+                const uint32_t callbackAddress = IopMemory::physicalAddress(a0);
+                const uint32_t callerGp = IopMemory::physicalAddress(cpu.gpr[28]);
+                const auto owner = std::find_if(modules.begin(), modules.end(), [&](const auto &item)
+                {
+                    const Module &module = item.second;
+                    return IopMemory::physicalAddress(module.gp) == callerGp &&
+                           callbackAddress >= module.base && callbackAddress - module.base < module.size;
+                });
+                if (a0 == 0u || owner == modules.end() || cpu.gpr[6] != 0u)
+                {
+                    std::ostringstream out;
+                    out << "[IOP_POSTBOOT_CALLBACK_REGISTER] accepted=false"
+                        << " function=0x" << std::hex << a0
+                        << " priority=" << std::dec << static_cast<int32_t>(cpu.gpr[5])
+                        << " status=0x" << std::hex << cpu.gpr[6]
+                        << " reason=" << (cpu.gpr[6] != 0u ? "status-pointer-unsupported"
+                                                           : "callback-owner-unresolved");
+                    log(LogLevel::Warning, out.str());
+                    setV0(0xFFFFFFFFu);
+                    return ImportDisposition::Handled;
+                }
+
+                postBootCallbacks.push_back(PostBootCallback{
+                    callbackAddress,
+                    cpu.gpr[28],
+                    cpu.gpr[5],
+                    owner->second.id,
+                    owner->second.base,
+                    owner->second.size,
+                });
+                std::string ownerName = owner->second.path;
+                const size_t ownerSeparator = ownerName.find_last_of("/\\:#");
+                if (ownerSeparator != std::string::npos)
+                    ownerName.erase(0u, ownerSeparator + 1u);
+                std::ostringstream out;
+                out << "[IOP_POSTBOOT_CALLBACK_REGISTER] accepted=true"
+                    << " owner=" << ownerName
+                    << " function=0x" << std::hex << callbackAddress
+                    << " priority=" << std::dec << cpu.gpr[5]
+                    << " status=0x0";
+                log(LogLevel::Info, out.str());
+                setV0(0u);
+                return ImportDisposition::Handled;
+            }
             if (iequals(call.library, "loadcore") && loadcore.dispatchImport(call.ordinal, cpu))
                 return ImportDisposition::Handled;
 
@@ -1037,6 +1095,209 @@ namespace ps2x::iop::detail
             return result;
         }
 
+        bool runPostBootCallbacks()
+        {
+            refreshPendingModuleStarts();
+            if (postBootCallbacksDispatched || postBootCallbacks.empty())
+            {
+                log(LogLevel::Warning,
+                    postBootCallbacksDispatched
+                        ? "[IOP_POSTBOOT_CALLBACK] dispatched=false reason=already-dispatched"
+                        : "[IOP_POSTBOOT_CALLBACK] dispatched=false reason=no-registered-callbacks");
+                return false;
+            }
+
+            const auto pendingStart = std::find_if(modules.begin(), modules.end(), [](const auto &item)
+            {
+                return item.second.startPending;
+            });
+            if (pendingStart != modules.end())
+            {
+                log(LogLevel::Warning, "[IOP_POSTBOOT_CALLBACK] dispatched=false reason=module-start-pending");
+                return false;
+            }
+
+            // This DNAS image registers two THREADMAN callbacks and one
+            // EESYNC callback. Validate their identities before applying the
+            // priority ordering; other LOADCORE callback shapes remain
+            // unsupported until their ABI is established independently.
+            if (postBootCallbacks.size() != 3u)
+            {
+                std::ostringstream out;
+                out << "[IOP_POSTBOOT_CALLBACK] dispatched=false reason=unsupported-callback-count"
+                    << " count=" << postBootCallbacks.size();
+                log(LogLevel::Error, out.str());
+                return false;
+            }
+
+            bool foundThreadmanPriority2 = false;
+            bool foundThreadmanPriority3 = false;
+            bool foundEesyncPriority2 = false;
+            for (const PostBootCallback &callback : postBootCallbacks)
+            {
+                const auto owner = modules.find(callback.ownerModuleId);
+                if (owner == modules.end() || owner->second.base != callback.ownerBase ||
+                    owner->second.size != callback.ownerSize || !owner->second.startReturned ||
+                    callback.function < callback.ownerBase)
+                {
+                    log(LogLevel::Error,
+                        "[IOP_POSTBOOT_CALLBACK] dispatched=false reason=owner-module-unavailable");
+                    return false;
+                }
+
+                std::string ownerName = owner->second.path;
+                const size_t ownerSeparator = ownerName.find_last_of("/\\:#");
+                if (ownerSeparator != std::string::npos)
+                    ownerName.erase(0u, ownerSeparator + 1u);
+                const uint32_t functionOffset = callback.function - callback.ownerBase;
+                if (iequals(ownerName, "THREADMAN") && callback.priority == 2u && functionOffset == 0x3E8u &&
+                    !foundThreadmanPriority2)
+                {
+                    foundThreadmanPriority2 = true;
+                }
+                else if (iequals(ownerName, "THREADMAN") && callback.priority == 3u && functionOffset == 0x418u &&
+                         !foundThreadmanPriority3)
+                {
+                    foundThreadmanPriority3 = true;
+                }
+                else if (iequals(ownerName, "EESYNC") && callback.priority == 2u && functionOffset == 0x80u &&
+                         !foundEesyncPriority2)
+                {
+                    foundEesyncPriority2 = true;
+                }
+                else
+                {
+                    std::ostringstream out;
+                    out << "[IOP_POSTBOOT_CALLBACK] dispatched=false reason=unsupported-callback"
+                        << " owner=" << ownerName
+                        << " function=0x" << std::hex << callback.function
+                        << " offset=0x" << functionOffset
+                        << " priority=" << std::dec << callback.priority;
+                    log(LogLevel::Error, out.str());
+                    return false;
+                }
+            }
+            if (!foundThreadmanPriority2 || !foundThreadmanPriority3 || !foundEesyncPriority2)
+            {
+                log(LogLevel::Error,
+                    "[IOP_POSTBOOT_CALLBACK] dispatched=false reason=incomplete-supported-callback-set");
+                return false;
+            }
+
+            std::vector<PostBootCallback> orderedCallbacks = postBootCallbacks;
+            std::stable_sort(orderedCallbacks.begin(), orderedCallbacks.end(), [](const PostBootCallback &lhs,
+                                                                                  const PostBootCallback &rhs)
+            {
+                return lhs.priority > rhs.priority;
+            });
+
+            const uint32_t callbackEntriesSize = static_cast<uint32_t>((orderedCallbacks.size() + 1u) * sizeof(uint32_t));
+            const uint32_t callbackEntries = allocate(callbackEntriesSize, alignof(uint32_t));
+            if (callbackEntries == 0u)
+            {
+                log(LogLevel::Error,
+                    "[IOP_POSTBOOT_CALLBACK] dispatched=false reason=callback-entry-allocation-failed");
+                return false;
+            }
+            for (size_t i = 0u; i < orderedCallbacks.size(); ++i)
+                memory.write32(callbackEntries + static_cast<uint32_t>(i * sizeof(uint32_t)),
+                               orderedCallbacks[i].function);
+            memory.write32(callbackEntries + static_cast<uint32_t>(orderedCallbacks.size() * sizeof(uint32_t)), 0u);
+
+            bool callbackEntriesValid = true;
+            for (size_t i = 0u; i <= orderedCallbacks.size(); ++i)
+            {
+                const uint32_t expected = i < orderedCallbacks.size() ? orderedCallbacks[i].function : 0u;
+                if (memory.read32(callbackEntries + static_cast<uint32_t>(i * sizeof(uint32_t))) != expected)
+                {
+                    callbackEntriesValid = false;
+                    break;
+                }
+            }
+            if (!callbackEntriesValid)
+            {
+                (void)freeAllocation(callbackEntries);
+                log(LogLevel::Error,
+                    "[IOP_POSTBOOT_CALLBACK] dispatched=false reason=callback-entry-readback-failed");
+                return false;
+            }
+
+            uint32_t smflagBefore = 0u;
+            if (!memory.readSifRegister(4u, smflagBefore))
+            {
+                (void)freeAllocation(callbackEntries);
+                log(LogLevel::Error, "[IOP_POSTBOOT_CALLBACK] dispatched=false reason=SMFLAG-unavailable");
+                return false;
+            }
+            constexpr uint32_t kBootEnd = 0x00040000u;
+            if ((smflagBefore & kBootEnd) != 0u)
+            {
+                (void)freeAllocation(callbackEntries);
+                log(LogLevel::Error,
+                    "[IOP_POSTBOOT_CALLBACK] dispatched=false reason=BOOTEND-already-set-before-callbacks");
+                return false;
+            }
+
+            bool callbacksReturned = true;
+            bool eesyncReturned = false;
+            constexpr uint32_t kCallbackInstructionBudget = 1000000u;
+            for (size_t i = 0u; i < orderedCallbacks.size(); ++i)
+            {
+                const PostBootCallback &callback = orderedCallbacks[i];
+                const auto owner = modules.find(callback.ownerModuleId);
+                std::string ownerName = owner->second.path;
+                const size_t ownerSeparator = ownerName.find_last_of("/\\:#");
+                if (ownerSeparator != std::string::npos)
+                    ownerName.erase(0u, ownerSeparator + 1u);
+                const uint32_t nextEntry = callbackEntries + static_cast<uint32_t>((i + 1u) * sizeof(uint32_t));
+                const uint32_t nextFunction = memory.read32(nextEntry);
+                const uint32_t result = callFunction(callback.function, nextEntry, 0u, 0u, 0u,
+                                                     callback.gp, kCallbackInstructionBudget);
+                const bool returned = lastCallCompleted;
+                const uint64_t instructions = lastCallInstructions;
+                const uint32_t stopPc = lastCallStopPc;
+                if (iequals(ownerName, "EESYNC"))
+                    eesyncReturned = returned && result == 0u;
+
+                std::ostringstream out;
+                out << "[IOP_POSTBOOT_CALLBACK] index=" << std::dec << (i + 1u) << "/" << orderedCallbacks.size()
+                    << " dispatched=true owner=" << ownerName
+                    << " function=0x" << std::hex << callback.function
+                    << " priority=" << std::dec << callback.priority
+                    << " next_entry=0x" << std::hex << nextEntry
+                    << " next_function=0x" << nextFunction
+                    << " delayed=0 returned=" << (returned ? "true" : "false")
+                    << " result=0x" << std::hex << result
+                    << " instructions=" << std::dec << instructions
+                    << " stop_pc=0x" << std::hex << stopPc;
+                log(returned && result == 0u ? LogLevel::Info : LogLevel::Error, out.str());
+                if (!returned || result != 0u)
+                {
+                    callbacksReturned = false;
+                    break;
+                }
+            }
+
+            (void)freeAllocation(callbackEntries);
+            uint32_t smflagAfter = 0u;
+            const bool readBack = memory.readSifRegister(4u, smflagAfter);
+            postBootCallbacks.clear();
+            postBootCallbacksDispatched = true;
+            std::ostringstream out;
+            out << "[IOP_POSTBOOT_CALLBACK] complete=" << (callbacksReturned && eesyncReturned && readBack &&
+                                                              (smflagAfter & kBootEnd) != 0u ? "true" : "false")
+                << " callbacks=" << orderedCallbacks.size()
+                << " order=priority-descending-stable"
+                << " eesync_returned=" << (eesyncReturned ? "true" : "false")
+                << " smflag_before=0x" << std::hex << smflagBefore
+                << " smflag_after=0x" << smflagAfter
+                << " readback=" << (readBack ? "true" : "false");
+            const bool complete = callbacksReturned && eesyncReturned && readBack &&
+                                  (smflagAfter & kBootEnd) != 0u;
+            log(complete ? LogLevel::Info : LogLevel::Error, out.str());
+            return complete;
+        }
+
         ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image,
                                    const void *arguments, uint32_t argumentSize,
                                    bool scheduleStart = false,
@@ -1333,6 +1594,12 @@ namespace ps2x::iop::detail
             kernel.terminateThreadsInRange(it->second.base, it->second.size);
             rpc.removeServersInRange(it->second.base, it->second.size);
             imports.eraseRange(it->second.base, it->second.size);
+            postBootCallbacks.erase(
+                std::remove_if(postBootCallbacks.begin(), postBootCallbacks.end(), [&](const PostBootCallback &callback)
+                {
+                    return callback.ownerModuleId == moduleId;
+                }),
+                postBootCallbacks.end());
             (void)memory.unregisterModuleImage(it->second.base, it->second.size);
             modules.erase(it);
             kernel.cleanupDeadThreads();
@@ -1360,6 +1627,8 @@ namespace ps2x::iop::detail
         std::map<int, Module> modules;
         std::map<int, PendingDma> pendingDmaInterrupts;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
+        std::vector<PostBootCallback> postBootCallbacks;
+        bool postBootCallbacksDispatched = false;
         uint32_t nextModuleId = 1;
         uint32_t moduleCursor = kModuleLoadBase;
         struct ScheduledExportCall
@@ -1478,6 +1747,11 @@ namespace ps2x::iop::detail
     bool IopEmulator::stopModule(int32_t moduleId, int32_t *result)
     {
         return m_impl->stopModule(moduleId, result);
+    }
+
+    bool IopEmulator::runPostBootCallbacks()
+    {
+        return m_impl->runPostBootCallbacks();
     }
 
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
