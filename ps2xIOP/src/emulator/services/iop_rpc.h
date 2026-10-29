@@ -38,6 +38,15 @@ namespace ps2x::iop::detail
         {
             return executeGuestFunction(address, a0, a1, a2, a3, gp);
         }
+        [[nodiscard]] virtual bool scheduleGuestFunction(uint32_t,
+                                                         uint32_t,
+                                                         uint32_t,
+                                                         uint32_t,
+                                                         uint32_t,
+                                                         uint32_t)
+        {
+            return false;
+        }
     };
 
     class IopRpcBridge

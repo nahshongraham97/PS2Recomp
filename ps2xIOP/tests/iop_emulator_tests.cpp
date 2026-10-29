@@ -208,6 +208,67 @@ namespace
         std::memcpy(host.guest.data() + address + codeOffset, code, sizeof(code));
     }
 
+    void writeCpuInvokeInKmodeIrx(TestHost &host, uint32_t address)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00010000u;
+        constexpr uint32_t codeSize = 0x60u;
+
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu;
+        header.ident[1] = 'E';
+        header.ident[2] = 'L';
+        header.ident[3] = 'F';
+        header.ident[4] = 1u;
+        header.ident[5] = 1u;
+        header.ident[6] = 1u;
+        header.type = 2u;
+        header.machine = 8u;
+        header.version = 1u;
+        header.entry = loadAddress;
+        header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader);
+        header.phentsize = sizeof(ProgramHeader);
+        header.phnum = 1u;
+
+        ProgramHeader program{};
+        program.type = 1u;
+        program.offset = codeOffset;
+        program.vaddr = loadAddress;
+        program.paddr = loadAddress;
+        program.filesz = codeSize;
+        program.memsz = codeSize;
+        program.flags = 7u;
+        program.align = 4u;
+
+        const uint32_t entry[] = {
+            0x3C040001u, // lui   a0, 1
+            0x34840040u, // ori   a0, a0, 0x40 (guest function)
+            0x24051234u, // addiu a1, zero, 0x1234
+            0x24065678u, // addiu a2, zero, 0x5678
+            0x2402000Cu, // addiu v0, zero, CpuInvokeInKmode syscall code
+            0x0000000Cu, // syscall
+            0x03E00008u, // jr    ra (resume after syscall)
+            0x00000000u, // nop
+        };
+        const uint32_t function[] = {
+            0x24080200u, // addiu t0, zero, 0x200 (spans multiple IOP slices)
+            0x2508FFFFu, // addiu t0, t0, -1
+            0x1500FFFEu, // bne   t0, zero, back to the decrement
+            0x00000000u, // nop
+            0x00851021u, // addu  v0, a0, a1
+            0x03E00008u, // jr    ra
+            0x00000000u, // nop
+        };
+        std::vector<uint8_t> segment(codeSize, 0u);
+        std::memcpy(segment.data(), entry, sizeof(entry));
+        std::memcpy(segment.data() + 0x40u, function, sizeof(function));
+
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
+    }
+
     void writeRpcServerIrx(TestHost &host,
                            uint32_t address,
                            uint32_t sid = 0xF00DCAFEu)
@@ -873,9 +934,19 @@ namespace
             0x8FBF000Cu, 0x27BD0010u, 0x03E00008u, 0x24020000u,
         };
         const uint32_t handler[] = {
+            0x3C040001u, 0x348401C0u, // a0 = guest target
+            0x24051234u, 0x24065678u, // target args
+            0x2402000Cu, 0x0000000Cu, // CpuInvokeInKmode
             0x3C080001u, 0x35080180u, // t0 = marker address
-            0x24090001u,             // t1 = 1
-            0xAD090000u,             // sw t1,0(t0)
+            0x24090001u, 0xAD090000u, // marker = 1
+            0xAD020004u,             // store CpuInvokeInKmode result
+            0x03E00008u, 0x00000000u,
+        };
+        const uint32_t kmodeTarget[] = {
+            0x24080100u,              // addiu t0, zero, 0x100
+            0x2508FFFFu,              // addiu t0, t0, -1
+            0x1500FFFEu, 0x00000000u, // bne t0, zero, back to decrement; nop
+            0x00851021u,              // addu v0, a0, a1
             0x03E00008u, 0x00000000u,
         };
         const uint32_t imports[] = {
@@ -889,6 +960,7 @@ namespace
         std::vector<uint8_t> segment(program.filesz, 0u);
         std::memcpy(segment.data(), entry, sizeof(entry));
         std::memcpy(segment.data() + 0x140u, handler, sizeof(handler));
+        std::memcpy(segment.data() + 0x1C0u, kmodeTarget, sizeof(kmodeTarget));
         std::memcpy(segment.data() + 0x100u, imports, sizeof(imports));
         std::memset(host.guest.data() + address, 0, codeOffset + program.filesz);
         std::memcpy(host.guest.data() + address, &header, sizeof(header));
@@ -1268,6 +1340,46 @@ int main()
     if (!expect(stopResult == 0, "Emulated module stop result mismatch")) return 1;
     if (!expect(iop.debugSnapshot().emulatorLoadedModules == 0u, "Module was not released")) return 1;
 
+    writeCpuInvokeInKmodeIrx(host, 0x100u);
+    const ModuleLoadResult kmodeInvoke = iop.loadModuleBuffer(0x100u);
+    const bool kmodeLogFound = std::any_of(host.logs.begin(), host.logs.end(), [](const std::string &line)
+    {
+        return line.find("[IOP_SYSCALL] code=0xc name=CpuInvokeInKmode completed=true") != std::string::npos &&
+               line.find("target=0x10040") != std::string::npos &&
+               line.find("arg0=0x1234") != std::string::npos &&
+               line.find("arg1=0x5678") != std::string::npos &&
+               line.find("result=0x68ac") != std::string::npos;
+    });
+    if (!expect(kmodeInvoke.handled && kmodeInvoke.moduleId > 0 && kmodeInvoke.startResult == 0x68ACu,
+                "CpuInvokeInKmode did not invoke the guest function with shifted arguments"))
+    {
+        std::cerr << "  result handled=" << kmodeInvoke.handled << " module=" << kmodeInvoke.moduleId
+                  << " start=0x" << std::hex << static_cast<uint32_t>(kmodeInvoke.startResult) << std::dec << '\n';
+        for (const std::string &line : host.logs)
+            std::cerr << "  log=" << line << '\n';
+        return 1;
+    }
+    if (!expect(kmodeLogFound, "CpuInvokeInKmode completion trace omitted its guest call details")) return 1;
+
+    iop.reset();
+    writeCpuInvokeInKmodeIrx(host, 0x100u);
+    const ModuleLoadResult slicedKmodeInvoke = iop.loadModuleBufferScheduled(0x100u);
+    if (!expect(slicedKmodeInvoke.handled && slicedKmodeInvoke.moduleId > 0 && slicedKmodeInvoke.startPending,
+                "Scheduled CpuInvokeInKmode fixture did not queue module_start")) return 1;
+    const uint64_t instructionsBeforeSlice = iop.debugSnapshot().emulatorInstructions;
+    iop.runEeCycles(8u * 16u);
+    const uint64_t instructionsAfterSlice = iop.debugSnapshot().emulatorInstructions;
+    const IopModuleStartState slicedKmodePending = iop.moduleStartState(slicedKmodeInvoke.moduleId);
+    if (!expect(slicedKmodePending.found && slicedKmodePending.pending &&
+                    instructionsAfterSlice - instructionsBeforeSlice <= 16u,
+                "CpuInvokeInKmode bypassed the IOP thread timeslice")) return 1;
+    iop.runEeCycles(8u * 4096u);
+    const IopModuleStartState slicedKmodeComplete = iop.moduleStartState(slicedKmodeInvoke.moduleId);
+    if (!expect(slicedKmodeComplete.found && !slicedKmodeComplete.pending &&
+                    slicedKmodeComplete.returned && slicedKmodeComplete.startResult == 0x68ACu,
+                "CpuInvokeInKmode continuation did not resume and complete across IOP slices")) return 1;
+    iop.reset();
+
     constexpr uint32_t rpcSid = 0xF00DCAFEu;
     writeRpcServerIrx(host, 0x100u);
     const ModuleLoadResult rpcModule = iop.loadModuleBuffer(0x100u);
@@ -1495,10 +1607,19 @@ int main()
     if (!expect(iop.readMemory(0x10180u, &sif1InterruptMarker, sizeof(sif1InterruptMarker)) &&
                     sif1InterruptMarker == 0u,
                 "SIF1 interrupt ran synchronously before IOP scheduler progress")) return 1;
-    iop.runEeCycles(8u);
+    const uint64_t instructionsBeforeSif1Handler = iop.debugSnapshot().emulatorInstructions;
+    iop.runEeCycles(8u * 16u);
+    const uint64_t instructionsAfterSif1Slice = iop.debugSnapshot().emulatorInstructions;
     if (!expect(iop.readMemory(0x10180u, &sif1InterruptMarker, sizeof(sif1InterruptMarker)) &&
-                    sif1InterruptMarker == 1u,
-                "Completed EE-to-IOP SIF DMA did not dispatch the registered SIF1 handler")) return 1;
+                    sif1InterruptMarker == 0u &&
+                    instructionsAfterSif1Slice - instructionsBeforeSif1Handler <= 16u,
+                "SIF1 guest handler bypassed the IOP scheduler slice while invoking kernel code")) return 1;
+    iop.runEeCycles(8u * 4096u);
+    if (!expect(iop.readMemory(0x10180u, &sif1InterruptMarker, sizeof(sif1InterruptMarker)) &&
+                    sif1InterruptMarker == 1u &&
+                    iop.readMemory(0x10184u, &sif1InterruptMarker, sizeof(sif1InterruptMarker)) &&
+                    sif1InterruptMarker == 0x68ACu,
+                "Scheduled SIF1 handler did not resume its CpuInvokeInKmode guest target")) return 1;
 
     iop.reset();
     constexpr uint32_t sifDmaDestination = 0xC00u;

@@ -158,6 +158,16 @@ namespace ps2x::iop::detail
             std::vector<uint8_t> bytes;
         };
 
+        struct CpuInvokeContinuation
+        {
+            uint32_t resumePc = 0u;
+            uint32_t callerRa = 0u;
+            uint32_t resumeStatus = 0u;
+            uint32_t target = 0u;
+            std::array<uint32_t, 3u> arguments{};
+            uint64_t startInstructions = 0u;
+        };
+
         explicit Impl(IopHost &hostRef)
             : host(hostRef),
               sysmem(host, memory),
@@ -193,6 +203,7 @@ namespace ps2x::iop::detail
             pendingGuestCallbacks.clear();
             postBootCallbacks.clear();
             postBootCallbacksDispatched = false;
+            cpuInvokeContinuations.clear();
             scheduledExportCalls.clear();
             nextScheduledCallId = 1u;
             nextModuleId = 1;
@@ -750,10 +761,142 @@ namespace ps2x::iop::detail
             return ImportDisposition::Missing;
         }
 
+        bool dispatchCpuInvokeInKmode(CpuState &cpu)
+        {
+            constexpr uint32_t kSyscallCode = 0x0Cu;
+            constexpr uint32_t kExceptionCodeSyscall = 8u;
+            constexpr uint32_t kExceptionBranchDelay = 0x80000000u;
+            constexpr uint32_t kKernelModeMask = 3u << 3u;
+
+            const uint32_t cause = cpu.cop0[13];
+            const uint32_t exceptionCode = (cause >> 2u) & 0x1Fu;
+            if (exceptionCode != kExceptionCodeSyscall || (cause & kExceptionBranchDelay) != 0u ||
+                cpu.gpr[2] != kSyscallCode)
+                return false;
+
+            const uint32_t function = cpu.gpr[4];
+            const uint32_t functionPhysical = physicalAddress(function);
+            const auto inModule = [&](uint32_t base, uint32_t size)
+            {
+                return size >= sizeof(uint32_t) && functionPhysical >= base &&
+                       functionPhysical - base <= size - sizeof(uint32_t);
+            };
+            const bool loadedModuleTarget = std::any_of(modules.begin(), modules.end(), [&](const auto &item)
+            {
+                return inModule(item.second.base, item.second.size);
+            });
+            const bool inFlightModuleTarget = std::any_of(inFlightModuleImages.begin(), inFlightModuleImages.end(),
+                                                           [&](const IopMemory::Allocation &image)
+            {
+                return inModule(image.address, image.size);
+            });
+            if (function == 0u || (function & 3u) != 0u || (!loadedModuleTarget && !inFlightModuleTarget))
+            {
+                std::ostringstream out;
+                out << "[IOP_SYSCALL] unsupported code=0xc name=CpuInvokeInKmode"
+                    << " epc=0x" << std::hex << cpu.cop0[14]
+                    << " target=0x" << function
+                    << " reason=target-not-in-loaded-module";
+                log(LogLevel::Error, out.str());
+                cpu.stopped = true;
+                return true;
+            }
+
+            const uint32_t exceptionStatus = cpu.cop0[12];
+            const uint32_t resumedStatus = (exceptionStatus & ~0x0Fu) | ((exceptionStatus >> 2u) & 0x0Fu);
+            CpuInvokeContinuation continuation;
+            continuation.resumePc = cpu.cop0[14] + 4u;
+            continuation.callerRa = cpu.gpr[31];
+            continuation.resumeStatus = resumedStatus;
+            continuation.target = function;
+            continuation.arguments = {cpu.gpr[5], cpu.gpr[6], cpu.gpr[7]};
+            continuation.startInstructions = totalInstructions;
+            cpuInvokeContinuations[&cpu].push_back(continuation);
+
+            cpu.pc = function;
+            cpu.gpr[4] = cpu.gpr[5];
+            cpu.gpr[5] = cpu.gpr[6];
+            cpu.gpr[6] = cpu.gpr[7];
+            cpu.gpr[7] = memory.read32(cpu.gpr[29] + 16u);
+            cpu.gpr[31] = kCallReturnSentinel;
+            cpu.cop0[12] = resumedStatus & ~kKernelModeMask;
+            cpu.exception = false;
+            cpu.stopped = false;
+            cpu.yielded = false;
+            cpu.pendingLoad = false;
+            cpu.branchPending = false;
+
+            std::ostringstream out;
+            out << "[IOP_SYSCALL] code=0xc name=CpuInvokeInKmode entered=true"
+                << " epc=0x" << std::hex << cpu.cop0[14]
+                << " target=0x" << function
+                << " arg0=0x" << cpu.gpr[4]
+                << " arg1=0x" << cpu.gpr[5]
+                << " arg2=0x" << cpu.gpr[6];
+            log(LogLevel::Info, out.str());
+            return true;
+        }
+
+        bool finishCpuInvokeInKmode(CpuState &cpu)
+        {
+            const auto calls = cpuInvokeContinuations.find(&cpu);
+            if (calls == cpuInvokeContinuations.end() || calls->second.empty())
+                return false;
+
+            const CpuInvokeContinuation continuation = calls->second.back();
+            calls->second.pop_back();
+            if (calls->second.empty())
+                cpuInvokeContinuations.erase(calls);
+
+            const uint32_t result = cpu.gpr[2];
+            cpu.gpr[2] = result;
+            cpu.gpr[31] = continuation.callerRa;
+            cpu.cop0[12] = continuation.resumeStatus;
+            cpu.pc = continuation.resumePc;
+            cpu.exception = false;
+            cpu.stopped = false;
+            cpu.yielded = false;
+            cpu.branchPending = false;
+            cpu.pendingLoad = false;
+
+            std::ostringstream out;
+            out << "[IOP_SYSCALL] code=0xc name=CpuInvokeInKmode completed=true"
+                << " resume=0x" << std::hex << continuation.resumePc
+                << " target=0x" << continuation.target
+                << " arg0=0x" << continuation.arguments[0]
+                << " arg1=0x" << continuation.arguments[1]
+                << " result=0x" << result
+                << " instructions=" << std::dec << (totalInstructions - continuation.startInstructions);
+            log(LogLevel::Info, out.str());
+            return true;
+        }
+
+        void discardCpuInvokeContinuationsInRange(uint32_t base, uint32_t size)
+        {
+            const auto addressInRange = [base, size](uint32_t address)
+            {
+                const uint32_t physical = physicalAddress(address);
+                return size != 0u && physical >= base && physical - base < size;
+            };
+            for (auto it = cpuInvokeContinuations.begin(); it != cpuInvokeContinuations.end();)
+            {
+                const bool ownedByRange = std::any_of(it->second.begin(), it->second.end(), [&](const auto &call)
+                {
+                    return addressInRange(call.target) || addressInRange(call.resumePc);
+                });
+                if (ownedByRange)
+                    it = cpuInvokeContinuations.erase(it);
+                else
+                    ++it;
+            }
+        }
+
         bool step(CpuState &cpu)
         {
             if (cpu.stopped)
                 return false;
+            if (cpu.pc == kCallReturnSentinel && finishCpuInvokeInKmode(cpu))
+                return true;
             if (cpu.pc == kThreadReturnSentinel || cpu.pc == kCallReturnSentinel)
             {
                 cpu.stopped = true;
@@ -788,6 +931,14 @@ namespace ps2x::iop::detail
             }
 
             const bool running = cpuCore.executeInstruction(cpu);
+            if (cpu.exception && dispatchCpuInvokeInKmode(cpu))
+            {
+                schedulePendingDma();
+                serviceCdvdDevice();
+                ++totalInstructions;
+                ++totalCycles;
+                return !cpu.stopped;
+            }
             schedulePendingDma();
             serviceCdvdDevice();
             ++totalInstructions;
@@ -855,6 +1006,8 @@ namespace ps2x::iop::detail
             cpu.gpr[31] = kCallReturnSentinel;
             lastCallInstructions = runCpu(cpu, budget);
             lastCallCompleted = cpu.pc == kCallReturnSentinel && !cpu.exception;
+            if (!lastCallCompleted)
+                cpuInvokeContinuations.erase(&cpu);
             lastCallStopPc = cpu.pc;
             return cpu.gpr[2];
         }
@@ -878,6 +1031,32 @@ namespace ps2x::iop::detail
                                                 uint32_t instructionBudget) override
         {
             return callFunction(address, a0, a1, a2, a3, gp, instructionBudget);
+        }
+
+        bool scheduleGuestFunction(uint32_t address,
+                                   uint32_t a0,
+                                   uint32_t a1,
+                                   uint32_t a2,
+                                   uint32_t a3,
+                                   uint32_t gp) override
+        {
+            const uint32_t function = physicalAddress(address);
+            const uint32_t globalPointer = physicalAddress(gp);
+            const auto owner = std::find_if(modules.begin(), modules.end(), [&](const auto &item)
+            {
+                const Module &module = item.second;
+                return physicalAddress(module.gp) == globalPointer && function >= module.base &&
+                       function - module.base < module.size;
+            });
+            if (owner == modules.end())
+                return false;
+
+            const int threadId = kernel.scheduleFunction(address, a0, a1, a2, a3, gp);
+            if (threadId > 0)
+                return true;
+
+            log(LogLevel::Error, "[IOP_INTERRUPT] guest handler scheduling failed");
+            return false;
         }
 
         // Not that good to use exception handling for control flow but will do for now
@@ -1028,6 +1207,20 @@ namespace ps2x::iop::detail
                     {
                         thread->instructionsExecuted += executed;
                         kernel.endTimeslice(*thread, kThreadReturnSentinel);
+                        if (std::getenv("PS2X_IOP_THREAD_TRACE") != nullptr)
+                        {
+                            std::ostringstream out;
+                            out << "[IOP_THREAD_SLICE] id=" << thread->id
+                                << " state=" << static_cast<unsigned int>(thread->state)
+                                << " entry=0x" << std::hex << thread->entry
+                                << " pc=0x" << thread->cpu.pc
+                                << " v0=0x" << thread->cpu.gpr[2]
+                                << " v1=0x" << thread->cpu.gpr[3]
+                                << " t0=0x" << thread->cpu.gpr[8]
+                                << " fp=0x" << thread->cpu.gpr[30]
+                                << " instructions=" << std::dec << thread->instructionsExecuted;
+                            log(LogLevel::Info, out.str());
+                        }
                     }
                     refreshPendingModuleStarts();
                     if (totalCycles == before)
@@ -1074,6 +1267,7 @@ namespace ps2x::iop::detail
                     freeAllocation(module.startArguments);
                 module.startArguments = 0u;
                 module.startThreadId = 0;
+                cpuInvokeContinuations.erase(&thread->cpu);
                 (void)kernel.releaseThread(thread->id);
             }
         }
@@ -1397,7 +1591,9 @@ namespace ps2x::iop::detail
                 log(LogLevel::Info, out.str());
                 return result;
             }
+            inFlightModuleImages.push_back({module.base, module.size});
             const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
+            inFlightModuleImages.pop_back();
             if (args)
                 freeAllocation(args);
             if (!lastCallCompleted)
@@ -1609,8 +1805,11 @@ namespace ps2x::iop::detail
             const IopThread *thread = kernel.findThread(call->second.threadId);
             if (thread && thread->state == IopThreadState::Running)
                 return false;
+            const CpuState *threadCpu = thread ? &thread->cpu : nullptr;
             if (thread && !kernel.releaseThread(call->second.threadId))
                 return false;
+            if (threadCpu)
+                cpuInvokeContinuations.erase(threadCpu);
             scheduledExportCalls.erase(call);
             return true;
         }
@@ -1621,6 +1820,7 @@ namespace ps2x::iop::detail
             if (it == modules.end())
                 return false;
             // A removable IRX normally exposes a stop entry through module metadata. We do not guess it; terminate owned execution and release the image cleanly.
+            discardCpuInvokeContinuationsInRange(it->second.base, it->second.size);
             kernel.terminateThreadsInRange(it->second.base, it->second.size);
             rpc.removeServersInRange(it->second.base, it->second.size);
             imports.eraseRange(it->second.base, it->second.size);
@@ -1655,6 +1855,8 @@ namespace ps2x::iop::detail
         IopImportRegistry imports;
         IopLoadcore loadcore;
         std::map<int, Module> modules;
+        std::vector<IopMemory::Allocation> inFlightModuleImages;
+        std::map<const CpuState *, std::vector<CpuInvokeContinuation>> cpuInvokeContinuations;
         uint32_t rom0ImageSize = 0u;
         std::map<int, PendingDma> pendingDmaInterrupts;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;

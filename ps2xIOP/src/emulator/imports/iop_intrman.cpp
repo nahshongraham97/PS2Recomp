@@ -172,13 +172,21 @@ namespace ps2x::iop::detail
         if (handler == m_handlers.end() || handler->second.function == 0u)
             return false;
 
+        if (executor.scheduleGuestFunction(handler->second.function,
+                                           handler->second.argument,
+                                           0u,
+                                           0u,
+                                           0u,
+                                           handler->second.gp))
+            return true;
+
         const uint32_t result = executor.executeGuestFunctionWithBudget(handler->second.function,
-                                                                          handler->second.argument,
-                                                                          0u,
-                                                                          0u,
-                                                                          0u,
-                                                                          handler->second.gp,
-                                                                          100000u);
+                                                                         handler->second.argument,
+                                                                         0u,
+                                                                         0u,
+                                                                         0u,
+                                                                         handler->second.gp,
+                                                                         100000u);
         if (irq == 0x02 && cdvdTraceEnabled())
             std::cerr << "[IOP_CDVD_IRQ_HANDLER_RETURN] entry=0x" << std::hex
                       << handler->second.function << " result=0x" << result << std::dec << std::endl;
