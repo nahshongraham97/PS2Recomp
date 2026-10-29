@@ -76,6 +76,19 @@ namespace ps2x::iop::detail
             return true;
         }
 
+        bool isRom0ImagePath(std::string_view path)
+        {
+            const size_t separator = path.find_last_of("/\\");
+            const std::string_view filename = separator == std::string_view::npos
+                                                  ? path
+                                                  : path.substr(separator + 1u);
+            if (iequals(filename, "ROM0"))
+                return true;
+            const size_t extension = filename.find_last_of('.');
+            return extension != std::string_view::npos &&
+                   iequals(filename.substr(extension), ".ROM0");
+        }
+
     }
 
     class IopEmulator::Impl final : public IopGuestExecutor
@@ -746,7 +759,11 @@ namespace ps2x::iop::detail
                 cpu.stopped = true;
                 return false;
             }
-            if (physicalAddress(cpu.pc) >= kRamSize)
+            const uint32_t physicalPc = physicalAddress(cpu.pc);
+            const bool inMappedRom0 = rom0ImageSize != 0u &&
+                                      physicalPc >= IopMemory::Rom0Base &&
+                                      physicalPc - IopMemory::Rom0Base < rom0ImageSize;
+            if (physicalPc >= kRamSize && !inMappedRom0)
             {
                 std::ostringstream out;
                 out << "[IOP] execution outside RAM pc=0x" << std::hex << cpu.pc;
@@ -1488,6 +1505,19 @@ namespace ps2x::iop::detail
                 log(LogLevel::Warning, lastError);
                 return {true, -1, -1, false};
             }
+            if (isRom0ImagePath(imagePath))
+            {
+                if (!memory.setRom0Image(image))
+                {
+                    lastError = "[IOP] ROM0 image is outside the supported mapping size";
+                    log(LogLevel::Error, lastError);
+                    return {true, -1, -1, false};
+                }
+                rom0ImageSize = static_cast<uint32_t>(image.size());
+                std::ostringstream out;
+                out << "[IOP] mapped ROM0 bytes=0x" << std::hex << rom0ImageSize;
+                log(LogLevel::Info, out.str());
+            }
             std::string modulePath(imagePath);
             modulePath.push_back('#');
             modulePath.append(moduleName);
@@ -1625,6 +1655,7 @@ namespace ps2x::iop::detail
         IopImportRegistry imports;
         IopLoadcore loadcore;
         std::map<int, Module> modules;
+        uint32_t rom0ImageSize = 0u;
         std::map<int, PendingDma> pendingDmaInterrupts;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
         std::vector<PostBootCallback> postBootCallbacks;
@@ -1841,7 +1872,10 @@ namespace ps2x::iop::detail
 
     bool IopEmulator::setRom0Image(std::span<const uint8_t> image)
     {
-        return m_impl->memory.setRom0Image(image);
+        if (!m_impl->memory.setRom0Image(image))
+            return false;
+        m_impl->rom0ImageSize = static_cast<uint32_t>(image.size());
+        return true;
     }
 
     bool IopEmulator::zeroMemory(uint32_t address, size_t size)
