@@ -1380,6 +1380,59 @@ int main()
                 "CpuInvokeInKmode continuation did not resume and complete across IOP slices")) return 1;
     iop.reset();
 
+    writeSif1InterruptIrx(host, 0x100u);
+    const ModuleLoadResult sif1InterruptModule = iop.loadModuleBuffer(0x100u);
+    uint32_t sif1InterruptMarker = 0u;
+    if (!expect(sif1InterruptModule.handled && sif1InterruptModule.startResult == 0,
+                "SIF1 interrupt fixture did not register its guest handler")) return 1;
+    if (!expect(iop.readMemory(0x10180u, &sif1InterruptMarker, sizeof(sif1InterruptMarker)) &&
+                    sif1InterruptMarker == 0u,
+                "SIF1 fixture marker was not initially clear")) return 1;
+
+    iop.onSifTransfer({
+        SifTransferKind::GetOtherData,
+        SifTransferPhase::AfterCopy,
+        0x100u,
+        0x200u,
+        sizeof(uint32_t),
+    });
+    iop.onSifTransfer({
+        SifTransferKind::SetDma,
+        SifTransferPhase::BeforeCopy,
+        0x100u,
+        0x200u,
+        sizeof(uint32_t),
+    });
+    iop.runEeCycles(8u);
+    if (!expect(iop.readMemory(0x10180u, &sif1InterruptMarker, sizeof(sif1InterruptMarker)) &&
+                    sif1InterruptMarker == 0u,
+                "SIF1 interrupt fired before an EE-to-IOP transfer completed")) return 1;
+
+    iop.onSifTransfer({
+        SifTransferKind::SetDma,
+        SifTransferPhase::AfterCopy,
+        0x100u,
+        0x200u,
+        sizeof(uint32_t),
+    });
+    if (!expect(iop.readMemory(0x10180u, &sif1InterruptMarker, sizeof(sif1InterruptMarker)) &&
+                    sif1InterruptMarker == 0u,
+                "SIF1 interrupt ran synchronously before IOP scheduler progress")) return 1;
+    const uint64_t instructionsBeforeSif1Handler = iop.debugSnapshot().emulatorInstructions;
+    iop.runEeCycles(8u * 16u);
+    const uint64_t instructionsAfterSif1Slice = iop.debugSnapshot().emulatorInstructions;
+    if (!expect(iop.readMemory(0x10180u, &sif1InterruptMarker, sizeof(sif1InterruptMarker)) &&
+                    sif1InterruptMarker == 0u &&
+                    instructionsAfterSif1Slice - instructionsBeforeSif1Handler <= 16u,
+                "SIF1 guest handler bypassed the IOP scheduler slice while invoking kernel code")) return 1;
+    iop.runEeCycles(8u * 4096u);
+    if (!expect(iop.readMemory(0x10180u, &sif1InterruptMarker, sizeof(sif1InterruptMarker)) &&
+                    sif1InterruptMarker == 1u &&
+                    iop.readMemory(0x10184u, &sif1InterruptMarker, sizeof(sif1InterruptMarker)) &&
+                    sif1InterruptMarker == 0x68ACu,
+                "Scheduled SIF1 handler did not resume its CpuInvokeInKmode guest target")) return 1;
+    iop.reset();
+
     constexpr uint32_t rpcSid = 0xF00DCAFEu;
     writeRpcServerIrx(host, 0x100u);
     const ModuleLoadResult rpcModule = iop.loadModuleBuffer(0x100u);
@@ -1567,59 +1620,6 @@ int main()
     if (!expect(iop.readMemory(iopBuffer, &physicalIopPayload, sizeof(physicalIopPayload)) &&
                     physicalIopPayload == transferPayload,
                 "SIF notification corrupted physical IOP memory")) return 1;
-
-    iop.reset();
-    writeSif1InterruptIrx(host, 0x100u);
-    const ModuleLoadResult sif1InterruptModule = iop.loadModuleBuffer(0x100u);
-    uint32_t sif1InterruptMarker = 0u;
-    if (!expect(sif1InterruptModule.handled && sif1InterruptModule.startResult == 0,
-                "SIF1 interrupt fixture did not register its guest handler")) return 1;
-    if (!expect(iop.readMemory(0x10180u, &sif1InterruptMarker, sizeof(sif1InterruptMarker)) &&
-                    sif1InterruptMarker == 0u,
-                "SIF1 fixture marker was not initially clear")) return 1;
-
-    iop.onSifTransfer({
-        SifTransferKind::GetOtherData,
-        SifTransferPhase::AfterCopy,
-        0x100u,
-        0x200u,
-        sizeof(uint32_t),
-    });
-    iop.onSifTransfer({
-        SifTransferKind::SetDma,
-        SifTransferPhase::BeforeCopy,
-        0x100u,
-        0x200u,
-        sizeof(uint32_t),
-    });
-    iop.runEeCycles(8u);
-    if (!expect(iop.readMemory(0x10180u, &sif1InterruptMarker, sizeof(sif1InterruptMarker)) &&
-                    sif1InterruptMarker == 0u,
-                "SIF1 interrupt fired before an EE-to-IOP transfer completed")) return 1;
-
-    iop.onSifTransfer({
-        SifTransferKind::SetDma,
-        SifTransferPhase::AfterCopy,
-        0x100u,
-        0x200u,
-        sizeof(uint32_t),
-    });
-    if (!expect(iop.readMemory(0x10180u, &sif1InterruptMarker, sizeof(sif1InterruptMarker)) &&
-                    sif1InterruptMarker == 0u,
-                "SIF1 interrupt ran synchronously before IOP scheduler progress")) return 1;
-    const uint64_t instructionsBeforeSif1Handler = iop.debugSnapshot().emulatorInstructions;
-    iop.runEeCycles(8u * 16u);
-    const uint64_t instructionsAfterSif1Slice = iop.debugSnapshot().emulatorInstructions;
-    if (!expect(iop.readMemory(0x10180u, &sif1InterruptMarker, sizeof(sif1InterruptMarker)) &&
-                    sif1InterruptMarker == 0u &&
-                    instructionsAfterSif1Slice - instructionsBeforeSif1Handler <= 16u,
-                "SIF1 guest handler bypassed the IOP scheduler slice while invoking kernel code")) return 1;
-    iop.runEeCycles(8u * 4096u);
-    if (!expect(iop.readMemory(0x10180u, &sif1InterruptMarker, sizeof(sif1InterruptMarker)) &&
-                    sif1InterruptMarker == 1u &&
-                    iop.readMemory(0x10184u, &sif1InterruptMarker, sizeof(sif1InterruptMarker)) &&
-                    sif1InterruptMarker == 0x68ACu,
-                "Scheduled SIF1 handler did not resume its CpuInvokeInKmode guest target")) return 1;
 
     iop.reset();
     constexpr uint32_t sifDmaDestination = 0xC00u;
